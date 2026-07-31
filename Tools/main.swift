@@ -55,11 +55,21 @@ let forcedLevel = Int(flag("--level", default: "-1")).flatMap { $0 >= 0 ? $0 : n
 let forcedShot = ["drift", "cctv"].contains(flag("--shot", default: "")) ? flag("--shot", default: "") : nil
 let preview = args.contains("--preview")
 
+func findWallTexture() -> URL? {
+    let exeDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+    let candidates = [
+        exeDir.appendingPathComponent("walltex.png"),
+        URL(fileURLWithPath: "Sources/Resources/walltex.png"),
+    ]
+    return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+}
+
 func makeRenderer() -> BackroomsRenderer {
     guard let device = MTLCreateSystemDefaultDevice() else { fatalError("no Metal device") }
     do {
         let r = try BackroomsRenderer(device: device, targetPixelFormat: .bgra8Unorm,
-                                      preview: preview, seed: seed)
+                                      preview: preview, seed: seed,
+                                      wallTextureURL: findWallTexture())
         r.director.forcedLevel = forcedLevel
         r.director.forcedShot = forcedShot
         if preRoll > 0 {

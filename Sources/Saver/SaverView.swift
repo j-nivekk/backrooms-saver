@@ -42,10 +42,13 @@ public final class BackroomsSaverView: ScreenSaverView, MTKViewDelegate {
         view.layer?.isOpaque = true
 
         do {
+            let texURL = Bundle(for: BackroomsSaverView.self)
+                .url(forResource: "walltex", withExtension: "png")
             renderer = try BackroomsRenderer(device: device,
                                              targetPixelFormat: view.colorPixelFormat,
                                              preview: isPreview,
-                                             seed: UInt32.random(in: 0..<UInt32.max))
+                                             seed: UInt32.random(in: 0..<UInt32.max),
+                                             wallTextureURL: texURL)
         } catch {
             failureText = "Backrooms renderer failed: \(error)"
             NSLog("[BackroomsSaver] %@", failureText!)

@@ -57,6 +57,14 @@ edges, threaded through the hashed doorway positions, densified into a
 corner-rounded polyline and followed by arc length. CCTV shots probe for the
 cell with the longest sightline and mount the camera near the ceiling.
 
+The only bitmap in the project is `Sources/Resources/walltex.png`, the Level 0
+wallpaper detail: ambientCG's Wallpaper001A (clean woodchip) and Wallpaper001C
+(damaged) — both **CC0 1.0**, free to redistribute — channel-packed into one
+texture (R = clean relief, G = damaged relief, B = damage colour). The shader
+blends clean → damaged using the procedural grime masks, so the damage never
+repeats with the 1 m tile, and the relief drives the wall bump normals. If the
+texture is missing the shader falls back to procedural paper grain.
+
 Level identity is a weight vector, not a scene switch: albedos, light colour /
 density / shape, fog, door width, arch radius, pillar girth, ceiling height and
 the water plane all blend continuously, so one level melts into the next while

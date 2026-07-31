@@ -61,11 +61,13 @@ cat > "$SAVER/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+cp "$ROOT"/Sources/Resources/* "$SAVER/Contents/Resources/" 2>/dev/null || true
 codesign --force --sign - --timestamp=none "$SAVER" >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # 3. The development harness
 # ---------------------------------------------------------------------------
+cp "$ROOT"/Sources/Resources/walltex.png "$BUILD/" 2>/dev/null || true
 echo "==> compiling backdev"
 swiftc -O -wmo -target "$TARGET" \
   -module-name backdev \

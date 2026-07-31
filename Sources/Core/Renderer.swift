@@ -1,4 +1,5 @@
 import Metal
+import MetalKit
 import simd
 
 enum RendererError: Error {
@@ -58,13 +59,46 @@ public final class BackroomsRenderer {
     private var frameIndex = 0
     private let inFlight = DispatchSemaphore(value: maxFramesInFlight)
 
+    private let wallTexture: MTLTexture
+    private let hasWallTexture: Bool
+
+    /// `wallTextureURL` points at the channel-packed wallpaper detail texture
+    /// (R = clean woodchip relief, G = damaged relief, B = damage colour).
+    /// Missing texture falls back to the fully procedural paper grain.
     public init(device: MTLDevice, targetPixelFormat: MTLPixelFormat,
-                preview: Bool, seed: UInt32) throws {
+                preview: Bool, seed: UInt32, wallTextureURL: URL? = nil) throws {
         self.device = device
         guard let queue = device.makeCommandQueue() else { throw RendererError.noDevice }
         commandQueue = queue
         internalScale = preview ? 1.0 : 0.6
         director = Director(seed: seed, preview: preview)
+
+        if let url = wallTextureURL,
+           let tex = try? MTKTextureLoader(device: device).newTexture(URL: url, options: [
+               .allocateMipmaps: true,
+               .generateMipmaps: true,
+               .SRGB: false,
+               .textureStorageMode: MTLStorageMode.private.rawValue,
+               .textureUsage: MTLTextureUsage.shaderRead.rawValue,
+           ]) {
+            wallTexture = tex
+            hasWallTexture = true
+        } else {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                             width: 4, height: 4, mipmapped: false)
+            d.usage = .shaderRead
+            let t = device.makeTexture(descriptor: d)!
+            let grey = [UInt8](repeating: 128, count: 4 * 4 * 4)
+            grey.withUnsafeBytes { p in
+                t.replace(region: MTLRegionMake2D(0, 0, 4, 4), mipmapLevel: 0,
+                          withBytes: p.baseAddress!, bytesPerRow: 16)
+            }
+            wallTexture = t
+            hasWallTexture = false
+            if wallTextureURL != nil {
+                NSLog("[BackroomsSaver] wall texture failed to load; using procedural grain")
+            }
+        }
 
         let lib: MTLLibrary
         do {
@@ -177,9 +211,10 @@ public final class BackroomsRenderer {
             upTanY: SIMD4(f.up.x, f.up.y, f.up.z, tanY),
             fwdSeed: SIMD4(f.fwd.x, f.fwd.y, f.fwd.z, Float(bitPattern: director.seed)),
             level: SIMD4(f.weights.x, f.weights.y, f.weights.z, f.waterY),
-            mode: SIMD4(f.cctv, f.globalLight, f.ceilH, 0))
+            mode: SIMD4(f.cctv, f.globalLight, f.ceilH, hasWallTexture ? 1 : 0))
 
-        pass(commandBuffer, label: "raymarch", pipeline: rayPipeline, target: hdr, inputs: []) { enc in
+        pass(commandBuffer, label: "raymarch", pipeline: rayPipeline, target: hdr,
+             inputs: [wallTexture]) { enc in
             enc.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
         }
 

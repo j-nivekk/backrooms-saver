@@ -273,8 +273,15 @@ struct Surface {
     float bumpAmt;
 };
 
+// Channel-packed CC0 wallpaper detail (ambientCG Wallpaper001A + 001C):
+// R = clean woodchip relief, G = damaged relief, B = damage colour luminance.
+// Where the damage sits is decided procedurally, so it never tiles.
+constexpr sampler wallSampler(filter::linear, mip_filter::linear, address::repeat);
+constant float kWallTexScale = 0.91;   // ~1.1 m per tile
+
 // kind: 0 floor, 1 ceiling, 2 wall
-static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, float waterY, MapCfg cfg)
+static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, float waterY,
+                         texture2d<float> wallTex, float hasTex, MapCfg cfg)
 {
     Surface s;
     s.albedo = float3(0);
@@ -303,10 +310,23 @@ static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, float waterY, M
             a = mix(float3(0.63, 0.55, 0.29), float3(0.545, 0.465, 0.235), stripe);
             float grimeLo = smoothstep(0.55, 0.0, p.y);
             float grimeHi = smoothstep(cfg.ceilH - 0.45, cfg.ceilH, p.y);
-            float stain = smoothstep(0.55, 0.85, fbm(float2(along * 0.45, p.y * 0.45)));
+            float sf = fbm(float2(along * 0.45, p.y * 0.45));
+            float stain = smoothstep(0.55, 0.85, sf);
             a *= 1.0 - 0.32 * grimeLo - 0.18 * grimeHi - 0.28 * stain;
-            // Paper grain, scuff streaks, and a per-region tint of the yellow
-            a *= 0.96 + 0.07 * vnoise(float2(along, p.y) * 48.0);
+            if (hasTex > 0.5) {
+                // Woodchip relief modulates the paint; where the procedural
+                // damage mask bites, blend to the torn variant and let the
+                // grey plaster backing show through.
+                float4 tx = wallTex.sample(wallSampler, float2(along, p.y) * kWallTexScale);
+                float dmg = clamp(smoothstep(0.42, 0.78, sf) + 0.30 * grimeLo, 0.0, 1.0);
+                float relief = mix(tx.r, tx.g, dmg);
+                a *= 0.80 + 0.45 * relief;
+                float torn = dmg * smoothstep(0.88, 0.72, tx.b);
+                a = mix(a, float3(0.50, 0.455, 0.38) * (0.45 + 0.85 * tx.b), torn);
+            } else {
+                a *= 0.96 + 0.07 * vnoise(float2(along, p.y) * 48.0);
+            }
+            // Scuff streaks and a per-region tint of the yellow
             float scuff = smoothstep(0.60, 0.88, fbm(float2(along * 2.5, p.y * 0.7) + 4.2))
                         * smoothstep(1.1, 0.35, p.y);
             a *= 1.0 - 0.20 * scuff;
@@ -317,7 +337,9 @@ static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, float waterY, M
         }
         s.albedo += w.x * a;
         s.glossAmt += w.x * (kind == 2 ? 0.03 : 0.0);
-        s.bumpAmt += w.x * (kind == 2 ? 0.10 : (kind == 0 ? 0.06 : 0.0));
+        // With the texture, the real relief drives the wall bump instead
+        s.bumpAmt += w.x * (kind == 2 ? (hasTex > 0.5 ? 0.03 : 0.10)
+                                      : (kind == 0 ? 0.06 : 0.0));
     }
 
     if (w.y > 0.004) {
@@ -398,7 +420,8 @@ static float softShadow(float3 p, float3 L, float dist, MapCfg cfg)
 }
 
 static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float globalLight,
-                    float waterY, bool primary, MapCfg cfg)
+                    float waterY, bool primary, texture2d<float> wallTex, float hasTex,
+                    MapCfg cfg)
 {
     int kind = 2;
     if (n.y > 0.6 && p.y < 1.0) kind = 0;
@@ -420,7 +443,18 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
         }
     }
 
-    Surface s = surfaceAt(p, n, kind, w, waterY, cfg);
+    Surface s = surfaceAt(p, n, kind, w, waterY, wallTex, hasTex, cfg);
+
+    // Real woodchip relief bump on Level 0 walls
+    if (hasTex > 0.5 && kind == 2 && w.x > 0.004) {
+        float2 wuv = float2((fabs(n.x) > 0.5) ? p.z : p.x, p.y) * kWallTexScale;
+        const float te = 0.008;
+        float h0 = wallTex.sample(wallSampler, wuv).r;
+        float hx = wallTex.sample(wallSampler, wuv + float2(te, 0)).r;
+        float hy = wallTex.sample(wallSampler, wuv + float2(0, te)).r;
+        float3 uA = (fabs(n.x) > 0.5) ? float3(0, 0, 1) : float3(1, 0, 0);
+        n = normalize(n - (uA * (hx - h0) + float3(0, 1, 0) * (hy - h0)) * (w.x * 2.0));
+    }
 
     // Procedural bump: perturb the normal with an fbm gradient in the plane
     if (s.bumpAmt > 0.005) {
@@ -519,7 +553,8 @@ vertex FSOut fullscreen_vs(uint vid [[vertex_id]])
 }
 
 fragment float4 backrooms_fs(FSOut in [[stage_in]],
-                             constant RMUniforms &U [[buffer(0)]])
+                             constant RMUniforms &U [[buffer(0)]],
+                             texture2d<float> wallTex [[texture(0)]])
 {
     float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y);
     float3 ro = U.eyeTime.xyz;
@@ -552,7 +587,8 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
         float3 p = ro + rd * tHit;
         float3 n = calcNormal(p, cfg);
         float2 fq = (ro + rd * min(tHit, 14.0)).xz;
-        col = applyFog(shade(p, n, rd, w, t, globalLight, waterY, true, cfg), tHit, w, fq, t);
+        col = applyFog(shade(p, n, rd, w, t, globalLight, waterY, true, wallTex, U.mode.w, cfg),
+                       tHit, w, fq, t);
     } else {
         col = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
     }
@@ -592,7 +628,8 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
             if (rhit) {
                 float3 rp = wp + normalize(rrd) * rt;
                 float3 rn = calcNormal(rp, cfg);
-                rcol = applyFog(shade(rp, rn, normalize(rrd), w, t, globalLight, waterY, false, cfg),
+                rcol = applyFog(shade(rp, rn, normalize(rrd), w, t, globalLight, waterY, false,
+                                      wallTex, U.mode.w, cfg),
                                 tw + rt, w, wp.xz, t);
             } else {
                 rcol = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
