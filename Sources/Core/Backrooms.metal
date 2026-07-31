@@ -46,6 +46,13 @@ constant uint kSaltOrient  = 0x85EBCA6Bu;
 constant uint kSaltFlick   = 0xFD7046C5u;
 constant uint kSaltPillar  = 0xB55A4F09u;
 constant uint kSaltTint    = 0x7C3A11B7u;
+constant uint kSaltThick   = 0x1B873593u;
+constant uint kSaltLean    = 0xCC9E2D51u;
+constant uint kSaltHeight  = 0xE6546B64u;
+constant uint kSaltSoffit  = 0x38495AB5u;
+constant uint kSaltDoorSz  = 0x9B05688Cu;
+constant uint kSaltPilSize = 0x27B70A85u;
+constant uint kSaltPilShape = 0x2E1B2138u;
 
 static uint uhash(uint h)
 {
@@ -104,31 +111,64 @@ static float fbm(float2 p)
 
 struct MapCfg {
     float ceilH, doorW, doorH, doorR, pillarR, roundness, skirt;
+    float leanAmt, partProb, soffitProb;
     uint seed;
 };
 
+// Geometry variety lives here, but NOTHING may change passability: the Swift
+// path planner only knows "wall yes/no" and "door yes/no". So partitions only
+// appear on doorless walls (never crossed), soffits only on open edges (and
+// keep >= 2.3 m clearance under them), leans keep their footprint on the grid
+// line, and door size variation stays within the planner's margins.
 static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin, MapCfg cfg)
 {
     float oh = hcell(int2(floor(float2(e) / 6.0)), kSaltRegion, cfg.seed);
     float wallProb = oh < 0.55 ? 0.52 : 0.18;
     float doorProb = oh < 0.55 ? 0.78 : 0.90;
 
-    if (edgeHash(e, axis, kSaltWall, cfg.seed) >= wallProb) return 1e5;
-
     float along = (axis == 0) ? p.z : p.x;
     float perp  = (axis == 0) ? p.x : p.z;
     float aL = along - alongOrigin;
-    // Skirting board: the wall fattens slightly near the floor
-    float halfT = kHalfT + cfg.skirt * smoothstep(0.13, 0.05, p.y);
-    float d = max(abs(perp - lineC) - halfT, abs(aL - kCell * 0.5) - kCell * 0.5);
+    float aBox = abs(aL - kCell * 0.5) - kCell * 0.5;
+
+    // Conservative bound over every variant this wall could be (max thickness,
+    // max lean, skirt). Far from the slab, skip all the detail hashes: a lower
+    // bound is a valid sphere-tracing distance.
+    float dQuick = max(abs(perp - lineC) - (kHalfT * 1.8 + cfg.leanAmt + cfg.skirt), aBox);
+    if (dQuick > 0.55) return dQuick;
+
+    if (edgeHash(e, axis, kSaltWall, cfg.seed) >= wallProb) {
+        // Open edge - sometimes a soffit beam hangs across it.
+        float sh = edgeHash(e, axis, kSaltSoffit, cfg.seed);
+        if (sh >= cfg.soffitProb) return 1e5;
+        float yBot = max(cfg.ceilH - mix(0.5, 0.85, fract(sh * 9.3)), 2.3);
+        float d = max(abs(perp - lineC) - kHalfT * 1.4, aBox);
+        return max(d, yBot - p.y);
+    }
+
+    // Per-wall thickness, skirting, and an occasional lean that grows with height
+    float th = edgeHash(e, axis, kSaltThick, cfg.seed);
+    float halfT = kHalfT * (0.8 + 1.0 * th) + cfg.skirt * smoothstep(0.13, 0.05, p.y);
+    float lh = edgeHash(e, axis, kSaltLean, cfg.seed);
+    float lean = (lh < 0.25) ? (lh / 0.125 - 1.0) * cfg.leanAmt : 0.0;
+    float d = max(abs(perp - lineC - lean * (p.y / cfg.ceilH)) - halfT, aBox);
 
     if (edgeHash(e, axis, kSaltDoor, cfg.seed) < doorProb) {
         float frac = mix(0.28, 0.72, edgeHash(e, axis, kSaltDoorPos, cfg.seed));
-        float r = min(cfg.doorR, cfg.doorW * 0.45);
-        float2 q = abs(float2(aL - frac * kCell, p.y - cfg.doorH * 0.5 + 0.2))
-                 - float2(cfg.doorW * 0.5, cfg.doorH * 0.5 + 0.2) + r;
+        float ds = edgeHash(e, axis, kSaltDoorSz, cfg.seed);
+        float dw = cfg.doorW * (0.85 + 0.35 * ds);
+        float dh = cfg.doorH * (0.92 + 0.20 * fract(ds * 5.1));
+        float r = min(cfg.doorR, dw * 0.45);
+        float2 q = abs(float2(aL - frac * kCell, p.y - dh * 0.5 + 0.2))
+                 - float2(dw * 0.5, dh * 0.5 + 0.2) + r;
         float hole = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
         d = max(d, -hole);
+    } else {
+        // Doorless walls are sometimes only chest-high partitions
+        float hh = edgeHash(e, axis, kSaltHeight, cfg.seed);
+        if (hh < cfg.partProb) {
+            d = max(d, p.y - mix(1.05, 1.4, fract(hh * 7.7)));
+        }
     }
     return d;
 }
@@ -149,10 +189,19 @@ static float map(float3 p, MapCfg cfg)
     for (int k = 0; k < 4; ++k) {
         int2 corner = ci + int2(k & 1, k >> 1);
         float2 q = p.xz - float2(corner) * kCell;
-        float ph = hcell(corner, kSaltPillar, cfg.seed);
-        float r = (ph < 0.30) ? cfg.pillarR : 0.10;
         float dSq = max(abs(q.x), abs(q.y));
-        d = min(d, mix(dSq, length(q), cfg.roundness) - r);
+        if (dSq - 0.62 > 0.4) { d = min(d, dSq - 0.62); continue; }
+        float ph = hcell(corner, kSaltPillar, cfg.seed);
+        // The 0.10 minimum is load-bearing: corner plugs are the conservative
+        // bound that stops rays tunnelling past co-linear neighbour walls.
+        float r = 0.10;
+        float round = cfg.roundness;
+        if (ph < 0.30) {
+            float sh = hcell(corner, kSaltPilSize, cfg.seed);
+            r = clamp(cfg.pillarR * (0.45 + 1.35 * sh), 0.10, 0.60);
+            if (hcell(corner, kSaltPilShape, cfg.seed) < 0.35) round = 1.0;
+        }
+        d = min(d, mix(dSq, length(q), round) - r);
     }
     return d;
 }
@@ -491,6 +540,9 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
     cfg.pillarR = dot(w, float3(0.16, 0.45, 0.40));
     cfg.roundness = w.z;
     cfg.skirt = 0.016 * w.x;
+    cfg.leanAmt = dot(w, float3(0.06, 0.22, 0.05));
+    cfg.partProb = dot(w, float3(0.30, 0.35, 0.15));
+    cfg.soffitProb = dot(w, float3(0.25, 0.30, 0.15));
     cfg.seed = as_type<uint>(U.fwdSeed.w);
 
     bool hit;

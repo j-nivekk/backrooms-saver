@@ -44,6 +44,13 @@ tight mazes and vast open halls. Corner columns are always present: they read
 as architecture, but they are really the conservative bound that stops rays
 tunnelling past co-linear neighbour walls the 4-edge SDF evaluation cannot see.
 
+On top of the base grid, more hashes add geometric variety without touching
+passability: random-width pillars (square or round), walls of varying
+thickness, leaning walls whose footprint stays on the grid line, chest-high
+partition walls (only ever on doorless edges, which the camera never crosses),
+soffit beams hanging over open edges (always ≥ 2.3 m of clearance), and
+per-door width/height variation within the planner's margins.
+
 The same hashes are mirrored bit-for-bit in Swift (`Director.swift`), which is
 how the drift camera plans its path: a weighted random walk over passable cell
 edges, threaded through the hashed doorway positions, densified into a
