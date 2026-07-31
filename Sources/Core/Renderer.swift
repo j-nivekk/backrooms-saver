@@ -15,6 +15,10 @@ struct GPUUniforms {
     var fwdSeed: SIMD4<Float>
     var level: SIMD4<Float>
     var mode: SIMD4<Float>
+    var horror: SIMD4<Float>
+    var motion: SIMD4<Float>
+    var entPos: SIMD4<Float>
+    var entCfg: SIMD4<Float>
 }
 
 struct GPUComposite {
@@ -61,19 +65,14 @@ public final class BackroomsRenderer {
 
     private let wallTexture: MTLTexture
     private let hasWallTexture: Bool
+    private let woodTexture: MTLTexture
+    private let hasWoodTexture: Bool
 
-    /// `wallTextureURL` points at the channel-packed wallpaper detail texture
-    /// (R = clean woodchip relief, G = damaged relief, B = damage colour).
-    /// Missing texture falls back to the fully procedural paper grain.
-    public init(device: MTLDevice, targetPixelFormat: MTLPixelFormat,
-                preview: Bool, seed: UInt32, wallTextureURL: URL? = nil) throws {
-        self.device = device
-        guard let queue = device.makeCommandQueue() else { throw RendererError.noDevice }
-        commandQueue = queue
-        internalScale = preview ? 1.0 : 0.6
-        director = Director(seed: seed, preview: preview)
-
-        if let url = wallTextureURL,
+    /// Loads a channel-packed detail texture, or a neutral 4x4 stand-in if it is
+    /// missing - every shader that reads one has a procedural fallback path.
+    private static func loadDetail(_ device: MTLDevice, _ url: URL?,
+                                   _ label: String) -> (MTLTexture, Bool) {
+        if let url = url,
            let tex = try? MTKTextureLoader(device: device).newTexture(URL: url, options: [
                .allocateMipmaps: true,
                .generateMipmaps: true,
@@ -81,24 +80,37 @@ public final class BackroomsRenderer {
                .textureStorageMode: MTLStorageMode.private.rawValue,
                .textureUsage: MTLTextureUsage.shaderRead.rawValue,
            ]) {
-            wallTexture = tex
-            hasWallTexture = true
-        } else {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
-                                                             width: 4, height: 4, mipmapped: false)
-            d.usage = .shaderRead
-            let t = device.makeTexture(descriptor: d)!
-            let grey = [UInt8](repeating: 128, count: 4 * 4 * 4)
-            grey.withUnsafeBytes { p in
-                t.replace(region: MTLRegionMake2D(0, 0, 4, 4), mipmapLevel: 0,
-                          withBytes: p.baseAddress!, bytesPerRow: 16)
-            }
-            wallTexture = t
-            hasWallTexture = false
-            if wallTextureURL != nil {
-                NSLog("[BackroomsSaver] wall texture failed to load; using procedural grain")
-            }
+            return (tex, true)
         }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                         width: 4, height: 4, mipmapped: false)
+        d.usage = .shaderRead
+        let t = device.makeTexture(descriptor: d)!
+        let grey = [UInt8](repeating: 128, count: 4 * 4 * 4)
+        grey.withUnsafeBytes { p in
+            t.replace(region: MTLRegionMake2D(0, 0, 4, 4), mipmapLevel: 0,
+                      withBytes: p.baseAddress!, bytesPerRow: 16)
+        }
+        if url != nil {
+            NSLog("[BackroomsSaver] \(label) failed to load; using procedural detail")
+        }
+        return (t, false)
+    }
+
+    /// `wallTextureURL` is the wallpaper pack (R clean relief, G damaged relief,
+    /// B damage colour); `woodTextureURL` is the Hotel wainscot grain, greyscale.
+    /// Either one missing falls back to the procedural version of that material.
+    public init(device: MTLDevice, targetPixelFormat: MTLPixelFormat,
+                preview: Bool, seed: UInt32,
+                wallTextureURL: URL? = nil, woodTextureURL: URL? = nil) throws {
+        self.device = device
+        guard let queue = device.makeCommandQueue() else { throw RendererError.noDevice }
+        commandQueue = queue
+        internalScale = preview ? 1.0 : 0.6
+        director = Director(seed: seed, preview: preview)
+
+        (wallTexture, hasWallTexture) = Self.loadDetail(device, wallTextureURL, "wall texture")
+        (woodTexture, hasWoodTexture) = Self.loadDetail(device, woodTextureURL, "wood texture")
 
         let lib: MTLLibrary
         do {
@@ -210,11 +222,15 @@ public final class BackroomsRenderer {
             rightTanX: SIMD4(f.right.x, f.right.y, f.right.z, f.tanX),
             upTanY: SIMD4(f.up.x, f.up.y, f.up.z, tanY),
             fwdSeed: SIMD4(f.fwd.x, f.fwd.y, f.fwd.z, Float(bitPattern: director.seed)),
-            level: SIMD4(f.weights.x, f.weights.y, f.weights.z, f.waterY),
-            mode: SIMD4(f.cctv, f.globalLight, f.ceilH, hasWallTexture ? 1 : 0))
+            level: SIMD4(Float(f.levelA), Float(f.levelB), f.blend, f.waterY),
+            mode: SIMD4(f.cctv, f.globalLight, f.ceilH, hasWallTexture ? 1 : 0),
+            horror: SIMD4(f.horror, hasWoodTexture ? 1 : 0, 0, 0),
+            motion: SIMD4(f.motionCentre.x, f.motionCentre.y, f.motionFwd.x, f.motionFwd.y),
+            entPos: SIMD4(f.entity.x, f.entity.y, f.entity.z, f.entityAlpha),
+            entCfg: SIMD4(f.entityType, f.entityScale, f.entityPhase, 0))
 
         pass(commandBuffer, label: "raymarch", pipeline: rayPipeline, target: hdr,
-             inputs: [wallTexture]) { enc in
+             inputs: [wallTexture, woodTexture]) { enc in
             enc.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
         }
 

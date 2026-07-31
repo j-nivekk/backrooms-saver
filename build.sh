@@ -67,7 +67,7 @@ codesign --force --sign - --timestamp=none "$SAVER" >/dev/null 2>&1
 # ---------------------------------------------------------------------------
 # 3. The development harness
 # ---------------------------------------------------------------------------
-cp "$ROOT"/Sources/Resources/walltex.png "$BUILD/" 2>/dev/null || true
+cp "$ROOT"/Sources/Resources/*.png "$BUILD/" 2>/dev/null || true
 echo "==> compiling backdev"
 swiftc -O -wmo -target "$TARGET" \
   -module-name backdev \

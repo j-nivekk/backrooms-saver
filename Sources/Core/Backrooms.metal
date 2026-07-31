@@ -11,8 +11,12 @@ struct RMUniforms {
     float4 rightTanX;   // xyz right basis, w tan(fovX/2)
     float4 upTanY;      // xyz up basis, w tan(fovY/2)
     float4 fwdSeed;     // xyz forward basis, w world seed (as bits)
-    float4 level;       // xyz level weights (yellow, concrete, pool), w water height
-    float4 mode;        // x cctv, y global light, z ceiling height, w unused
+    float4 level;       // x level A, y level B, z blend A->B, w water height
+    float4 mode;        // x cctv, y global light, z ceiling height, w wall texture present
+    float4 horror;      // x horror amount, y wood texture present, zw unused
+    float4 motion;      // xy motion-light centre (xz), zw its forward (xz)
+    float4 entPos;      // xyz entity world position, w alpha (0 = none)
+    float4 entCfg;      // x type (0 smiler, 1 figure), y card scale, z phase, w unused
 };
 
 struct CompositeParams {
@@ -53,6 +57,7 @@ constant uint kSaltSoffit  = 0x38495AB5u;
 constant uint kSaltDoorSz  = 0x9B05688Cu;
 constant uint kSaltPilSize = 0x27B70A85u;
 constant uint kSaltPilShape = 0x2E1B2138u;
+constant uint kSaltMotion   = 0x6A09E667u;   // GPU-only: motion-light radius jitter
 
 static uint uhash(uint h)
 {
@@ -110,7 +115,11 @@ static float fbm(float2 p)
 // ---------------------------------------------------------------------------
 
 struct MapCfg {
-    float ceilH, doorW, doorH, doorR, pillarR, roundness, skirt;
+    float ceilH, doorW, doorH, doorR, pillarR, roundness, skirt, wainscotH;
+    // 1 / (0.35 * wainscotH - wainscotH), precomputed. wallSDF runs ~500 times
+    // per pixel and a smoothstep with variable edges hides a divide in there,
+    // which the old fixed 0.13/0.05 edges folded away. Cheap to keep folded.
+    float wainscotInv;
     float leanAmt, partProb, soffitProb;
     uint seed;
 };
@@ -148,7 +157,13 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
 
     // Per-wall thickness, skirting, and an occasional lean that grows with height
     float th = edgeHash(e, axis, kSaltThick, cfg.seed);
-    float halfT = kHalfT * (0.8 + 1.0 * th) + cfg.skirt * smoothstep(0.13, 0.05, p.y);
+    // The skirt bulge doubles as the Hotel's wainscot: same 2 cm of thickness,
+    // just carried up to `wainscotH`. dQuick already bounds it either way.
+    float halfT = kHalfT * (0.8 + 1.0 * th);
+    if (cfg.skirt > 0.0) {
+        float u = clamp((p.y - cfg.wainscotH) * cfg.wainscotInv, 0.0, 1.0);
+        halfT += cfg.skirt * (u * u * (3.0 - 2.0 * u));
+    }
     float lh = edgeHash(e, axis, kSaltLean, cfg.seed);
     float lean = (lh < 0.25) ? (lh / 0.125 - 1.0) * cfg.leanAmt : 0.0;
     float d = max(abs(perp - lineC - lean * (p.y / cfg.ceilH)) - halfT, aBox);
@@ -241,30 +256,142 @@ static float calcAO(float3 p, float3 n, MapCfg cfg)
 }
 
 // ---------------------------------------------------------------------------
-// The three moods, blended by U.level.xyz.
-//   0: Level 0 - yellow wallpaper, damp carpet, humming fluorescents
-//   1: concrete halls - dark, sparse strip lights, pillar forests
-//   2: poolrooms-ish - white tile, tall ceilings, water on the floor
+// Levels.
+//
+// Only two levels are ever live at once - the one being held and the one being
+// blended toward - so this takes a pair of ids plus a blend factor rather than
+// an N-wide weight vector. Shading cost is then constant no matter how many
+// levels exist, and holding a level (the common case) evaluates just one.
+//
+// Ids are append-only. The canon Backrooms level each one depicts is in the
+// comment; Director.swift owns the names shown in the CCTV overlay.
+//   0 -> Level 0    The Lobby         yellow wallpaper, damp carpet
+//   1 -> Level 1    Habitable Zone    concrete, sparse strip lights
+//   2 -> Level 37   Poolrooms         white tile, tall ceilings, water
+//   3 -> Level 4    Abandoned Office  beige drywall, carpet tile, cubicles
+//   4 -> Level 5    Terror Hotel      red paper, wainscot, low ceiling
+//   5 -> Level 94   Motion Lights     dark concrete, lights ignite near you
 // ---------------------------------------------------------------------------
 
-constant float3 kLightCol[3] = {
-    float3(1.00, 0.90, 0.66) * 7.5,
-    float3(0.70, 0.95, 0.78) * 9.5,
-    float3(0.85, 0.93, 1.05) * 8.0,
+// Material families. Levels pick a family per surface and supply the colour, so
+// six levels do not mean six sets of procedural material code.
+constant int kFamCarpet   = 0;
+constant int kFamPaper    = 1;   // wallpaper: stripe + woodchip relief + grime
+constant int kFamDrywall  = 2;   // flat painted board, scuffed
+constant int kFamConcrete = 3;
+constant int kFamTile     = 4;
+constant int kFamAcoustic = 5;   // suspended ceiling grid
+constant int kFamPlaster  = 6;
+constant int kFamWood     = 7;   // wainscot / trim
+constant int kFamPaint    = 8;   // skirting board
+
+struct LevelDef {
+    float3 lightCol;      // emissive colour with intensity folded in
+    float  panelProb;
+    float2 panelExt;
+    float3 amb;
+    float3 fogCol;
+    float  fogDen;
+    float3 floorCol, wallCol, ceilCol, trimCol;
+    int    floorFam, wallFam, ceilFam, trimFam;
+    float  floorParam;    // carpet/tile: grid pitch in metres (0 = none)
+    float  floorMotif;    // patterned carpet strength (Hotel)
+    float  wallParam;     // paper: stripe frequency | tile: grout pitch
+    float  doorW, doorH, doorR;
+    float  pillarR, roundness, skirt, wainscotH;
+    float  leanAmt, partProb, soffitProb;
+    float  motion;        // 1 = panels ignite by proximity to the eye
+    float  darkness;      // 1 = entities read as Smilers, 0 = as figures
 };
-constant float kPanelProb[3] = { 0.55, 0.30, 0.42 };
-constant float2 kPanelExt[3] = { float2(0.60, 0.32), float2(0.68, 0.07), float2(0.42, 0.42) };
-constant float3 kAmb[3] = {
-    float3(0.150, 0.128, 0.072),
-    float3(0.085, 0.096, 0.089),
-    float3(0.095, 0.110, 0.125),
+
+constant LevelDef kLevels[6] = {
+    {   // 0 - Level 0, The Lobby
+        float3(1.00, 0.90, 0.66) * 7.5, 0.55, float2(0.60, 0.32),
+        float3(0.150, 0.128, 0.072), float3(0.050, 0.042, 0.021), 0.075,
+        float3(0.400, 0.335, 0.170), float3(0.630, 0.550, 0.290),
+        float3(0.660, 0.650, 0.580), float3(0.300, 0.240, 0.120),
+        kFamCarpet, kFamPaper, kFamAcoustic, kFamPaint,
+        0.0, 0.0, 18.0,
+        1.50, 2.25, 0.03,
+        0.16, 0.00, 0.016, 0.130,
+        0.06, 0.30, 0.25,
+        0.0, 0.15
+    },
+    {   // 1 - Level 1, Habitable Zone
+        float3(0.70, 0.95, 0.78) * 9.5, 0.30, float2(0.68, 0.07),
+        float3(0.085, 0.096, 0.089), float3(0.022, 0.028, 0.025), 0.078,
+        float3(0.200, 0.210, 0.200), float3(0.330, 0.340, 0.330),
+        float3(0.250, 0.260, 0.250), float3(0.330, 0.340, 0.330),
+        kFamConcrete, kFamConcrete, kFamConcrete, kFamConcrete,
+        0.0, 0.0, 0.0,
+        2.30, 2.60, 0.06,
+        0.45, 0.00, 0.000, 0.130,
+        0.22, 0.35, 0.30,
+        0.0, 0.55
+    },
+    {   // 2 - Level 37, Poolrooms
+        float3(0.85, 0.93, 1.05) * 8.0, 0.42, float2(0.42, 0.42),
+        float3(0.095, 0.110, 0.125), float3(0.052, 0.062, 0.072), 0.042,
+        float3(0.660, 0.720, 0.760), float3(0.780, 0.820, 0.850),
+        float3(0.740, 0.770, 0.800), float3(0.740, 0.770, 0.800),
+        kFamTile, kFamTile, kFamTile, kFamTile,
+        0.50, 0.0, 0.30,
+        1.90, 3.10, 0.80,
+        0.40, 1.00, 0.000, 0.130,
+        0.05, 0.15, 0.15,
+        0.0, 0.10
+    },
+    {   // 3 - Level 4, Abandoned Office
+        float3(0.92, 0.96, 1.00) * 6.0, 0.62, float2(0.60, 0.32),
+        float3(0.100, 0.104, 0.112), float3(0.032, 0.035, 0.040), 0.052,
+        float3(0.240, 0.260, 0.300), float3(0.600, 0.585, 0.520),
+        float3(0.660, 0.660, 0.640), float3(0.470, 0.460, 0.420),
+        kFamCarpet, kFamDrywall, kFamAcoustic, kFamPaint,
+        0.50, 0.0, 0.35,
+        1.85, 2.35, 0.02,
+        0.20, 0.00, 0.012, 0.100,
+        0.04, 0.62, 0.22,
+        0.0, 0.20
+    },
+    {   // 4 - Level 5, Terror Hotel
+        float3(1.00, 0.84, 0.58) * 6.5, 0.34, float2(0.16, 0.16),
+        float3(0.100, 0.066, 0.044), float3(0.034, 0.020, 0.014), 0.062,
+        float3(0.300, 0.062, 0.058), float3(0.420, 0.150, 0.125),
+        float3(0.480, 0.435, 0.375), float3(0.150, 0.088, 0.052),
+        kFamCarpet, kFamPaper, kFamPlaster, kFamWood,
+        0.0, 1.0, 26.0,
+        1.35, 2.15, 0.35,
+        0.18, 0.35, 0.020, 0.950,
+        0.03, 0.20, 0.18,
+        0.0, 0.45
+    },
+    {   // 5 - Level 94, Motion Lights
+        float3(0.88, 0.94, 1.00) * 11.0, 0.70, float2(0.55, 0.30),
+        float3(0.032, 0.034, 0.040), float3(0.012, 0.014, 0.018), 0.090,
+        float3(0.170, 0.175, 0.180), float3(0.300, 0.305, 0.310),
+        float3(0.220, 0.225, 0.230), float3(0.300, 0.305, 0.310),
+        kFamConcrete, kFamConcrete, kFamConcrete, kFamConcrete,
+        0.0, 0.0, 0.0,
+        2.10, 2.50, 0.04,
+        0.30, 0.00, 0.000, 0.130,
+        0.10, 0.25, 0.28,
+        1.0, 1.00
+    },
 };
-constant float3 kFogCol[3] = {
-    float3(0.050, 0.042, 0.021),
-    float3(0.022, 0.028, 0.025),
-    float3(0.052, 0.062, 0.072),
+
+// Everything the shader needs about "where we are between two levels".
+// Indices, not copies: a LevelMix is passed through every shading function, and
+// two LevelDefs by value would be ~240 bytes of struct copied down the whole
+// call graph. The level pair is uniform across the draw, so reading kLevels[]
+// from the constant address space is a scalar load instead.
+struct LevelMix {
+    int ia, ib;           // indices into kLevels
+    float t;              // 0 = pure a, 1 = pure b
+    float horror;
 };
-constant float kFogDen[3] = { 0.075, 0.078, 0.042 };
+
+static float3 mixCol(thread const LevelMix &L, float3 ca, float3 cb) { return mix(ca, cb, L.t); }
+static float  mixF(thread const LevelMix &L, float va, float vb) { return mix(va, vb, L.t); }
 
 struct Surface {
     float3 albedo;
@@ -279,130 +406,240 @@ struct Surface {
 constexpr sampler wallSampler(filter::linear, mip_filter::linear, address::repeat);
 constant float kWallTexScale = 0.91;   // ~1.1 m per tile
 
-// kind: 0 floor, 1 ceiling, 2 wall
-static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, float waterY,
-                         texture2d<float> wallTex, float hasTex, MapCfg cfg)
+// Wood grain for the Hotel wainscot (ambientCG Wood051 displacement, CC0).
+// A carpet pack was tried alongside it and dropped: at every world scale it was
+// indistinguishable from the procedural fibre noise once mipmapped, so it was
+// 700 KB of bundle for nothing. Vertical surfaces near the camera repay a real
+// texture; the floor, seen at a grazing angle under flat light, does not.
+constant float kWoodTexScale = 0.85;   // wainscot, ~1.2 m per tile
+
+// One level's material at a point. kind: 0 floor, 1 ceiling, 2 wall.
+static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
+                           float waterY, texture2d<float> wallTex, float hasTex,
+                           texture2d<float> woodTex, float hasWood, MapCfg cfg)
 {
+    constant LevelDef &L = kLevels[li];
     Surface s;
-    s.albedo = float3(0);
     s.glossAmt = 0.0;
     s.glossPow = 24.0;
     s.bumpAmt = 0.0;
 
-    float along = (abs(n.x) > 0.5) ? p.z : p.x;
+    int fam = (kind == 0) ? L.floorFam : ((kind == 1) ? L.ceilFam : L.wallFam);
+    float3 base = (kind == 0) ? L.floorCol : ((kind == 1) ? L.ceilCol : L.wallCol);
 
-    if (w.x > 0.004) {
-        float3 a;
-        if (kind == 0) {
-            // Carpet: coarse mottling, fine fibre noise, big damp blotches
-            float fibers = 0.92 + 0.16 * vnoise(p.xz * 34.0);
-            float blotch = smoothstep(0.60, 0.88, fbm(p.xz * 0.33 + 7.3));
-            a = float3(0.40, 0.335, 0.170) * (0.85 + 0.30 * fbm(p.xz * 6.0));
-            a *= fibers * (1.0 - 0.22 * blotch);
-        } else if (kind == 1) {
-            // Acoustic tiles: per-tile tint drift, speckle, grid grooves
-            a = float3(0.66, 0.65, 0.58) * (0.95 + 0.09 * vhash(floor(p.xz)));
-            a *= 1.0 - 0.10 * smoothstep(0.78, 0.92, vnoise(p.xz * 34.0));
-            float2 g = abs(fract(p.xz) - 0.5);
-            a *= 1.0 - 0.22 * smoothstep(0.47, 0.5, max(g.x, g.y));
-        } else {
-            float stripe = smoothstep(0.30, 0.70, 0.5 + 0.5 * sin(along * 18.0));
-            a = mix(float3(0.63, 0.55, 0.29), float3(0.545, 0.465, 0.235), stripe);
-            float grimeLo = smoothstep(0.55, 0.0, p.y);
-            float grimeHi = smoothstep(cfg.ceilH - 0.45, cfg.ceilH, p.y);
-            float sf = fbm(float2(along * 0.45, p.y * 0.45));
-            float stain = smoothstep(0.55, 0.85, sf);
-            a *= 1.0 - 0.32 * grimeLo - 0.18 * grimeHi - 0.28 * stain;
-            if (hasTex > 0.5) {
-                // Woodchip relief modulates the paint; where the procedural
-                // damage mask bites, blend to the torn variant and let the
-                // grey plaster backing show through.
-                float4 tx = wallTex.sample(wallSampler, float2(along, p.y) * kWallTexScale);
-                float dmg = clamp(smoothstep(0.42, 0.78, sf) + 0.30 * grimeLo, 0.0, 1.0);
-                float relief = mix(tx.r, tx.g, dmg);
-                a *= 0.80 + 0.45 * relief;
-                float torn = dmg * smoothstep(0.88, 0.72, tx.b);
-                a = mix(a, float3(0.50, 0.455, 0.38) * (0.45 + 0.85 * tx.b), torn);
-            } else {
-                a *= 0.96 + 0.07 * vnoise(float2(along, p.y) * 48.0);
-            }
-            // Scuff streaks and a per-region tint of the yellow
-            float scuff = smoothstep(0.60, 0.88, fbm(float2(along * 2.5, p.y * 0.7) + 4.2))
-                        * smoothstep(1.1, 0.35, p.y);
-            a *= 1.0 - 0.20 * scuff;
-            a *= 0.93 + 0.14 * hcell(int2(floor(floor(p.xz / kCell) / 6.0)), kSaltTint, cfg.seed);
-            if (p.y < 0.115) {   // skirting board paint
-                a = float3(0.30, 0.24, 0.12) * (0.9 + 0.2 * vnoise(float2(along * 30.0, p.y * 60.0)));
-            }
-        }
-        s.albedo += w.x * a;
-        s.glossAmt += w.x * (kind == 2 ? 0.03 : 0.0);
-        // With the texture, the real relief drives the wall bump instead
-        s.bumpAmt += w.x * (kind == 2 ? (hasTex > 0.5 ? 0.03 : 0.10)
-                                      : (kind == 0 ? 0.06 : 0.0));
+    // Wall trim: skirting board, or the Hotel's full wainscot.
+    if (kind == 2 && L.skirt > 0.0001 && p.y < L.wainscotH * 0.88) {
+        fam = L.trimFam;
+        base = L.trimCol;
     }
 
-    if (w.y > 0.004) {
-        float3 a;
-        if (kind == 0) {
-            a = float3(0.20, 0.21, 0.20) * (0.85 + 0.25 * fbm(p.xz * 1.3));
-        } else if (kind == 1) {
-            a = float3(0.25, 0.26, 0.25) * (0.9 + 0.2 * fbm(p.xz * 0.9));
+    float3 a = base;
+
+    if (fam == kFamCarpet) {
+        // Coarse mottling, fibre structure, big damp blotches. The mid-scale
+        // fbm and the blotches stay procedural so nothing repeats with the tile.
+        float blotch = smoothstep(0.60, 0.88, fbm(p.xz * 0.33 + 7.3));
+        a = base * (0.85 + 0.30 * fbm(p.xz * 6.0));
+        a *= 0.92 + 0.16 * vnoise(p.xz * 34.0);
+        a *= 1.0 - 0.22 * blotch;
+        if (L.floorParam > 0.001) {
+            // Carpet tiles: seams plus a slight per-tile dye-lot drift
+            float2 g = abs(fract(p.xz / L.floorParam) - 0.5) * L.floorParam;
+            a *= 1.0 - 0.11 * smoothstep(0.030, 0.010, min(g.x, g.y));
+            a *= 0.95 + 0.09 * vhash(floor(p.xz / L.floorParam));
+        }
+        if (L.floorMotif > 0.001) {
+            // Hotel figure: two lattices at 45 degrees make a busy damask-ish
+            // repeat. Keep it small and low-contrast - a bold motif at carpet
+            // scale reads as lava, not as a pattern.
+            float2 m = p.xz * 3.2;
+            float2 r = float2(m.x + m.y, m.x - m.y) * 0.70711;
+            float fig = sin(m.x * 3.14159) * sin(m.y * 3.14159)
+                      + 0.7 * sin(r.x * 6.28318) * sin(r.y * 6.28318);
+            float motif = smoothstep(0.34, 0.70, fig * 0.5 + 0.5);
+            a = mix(a, a * float3(1.50, 1.24, 0.80), motif * L.floorMotif * 0.38);
+        }
+        s.bumpAmt = 0.06;
+    } else if (fam == kFamPaper) {
+        float stripe = smoothstep(0.30, 0.70, 0.5 + 0.5 * sin(along * L.wallParam));
+        a = mix(base, base * float3(0.865, 0.845, 0.810), stripe);
+        float grimeLo = smoothstep(0.55, 0.0, p.y);
+        float grimeHi = smoothstep(cfg.ceilH - 0.45, cfg.ceilH, p.y);
+        float sf = fbm(float2(along * 0.45, p.y * 0.45));
+        float stain = smoothstep(0.55, 0.85, sf);
+        a *= 1.0 - 0.32 * grimeLo - 0.18 * grimeHi - 0.28 * stain;
+        if (hasTex > 0.5) {
+            // Woodchip relief modulates the paint; where the procedural damage
+            // mask bites, blend to the torn variant and let the backing show.
+            float4 tx = wallTex.sample(wallSampler, float2(along, p.y) * kWallTexScale);
+            float dmg = clamp(smoothstep(0.42, 0.78, sf) + 0.30 * grimeLo, 0.0, 1.0);
+            float relief = mix(tx.r, tx.g, dmg);
+            a *= 0.80 + 0.45 * relief;
+            float torn = dmg * smoothstep(0.88, 0.72, tx.b);
+            a = mix(a, float3(0.50, 0.455, 0.38) * (0.45 + 0.85 * tx.b), torn);
         } else {
-            a = float3(0.33, 0.34, 0.33) * (0.80 + 0.30 * fbm(float2(along, p.y) * 1.7));
+            a *= 0.96 + 0.07 * vnoise(float2(along, p.y) * 48.0);
+        }
+        float scuff = smoothstep(0.60, 0.88, fbm(float2(along * 2.5, p.y * 0.7) + 4.2))
+                    * smoothstep(1.1, 0.35, p.y);
+        a *= 1.0 - 0.20 * scuff;
+        a *= 0.93 + 0.14 * hcell(int2(floor(floor(p.xz / kCell) / 6.0)), kSaltTint, cfg.seed);
+        s.glossAmt = 0.03;
+        s.bumpAmt = (hasTex > 0.5) ? 0.03 : 0.10;
+    } else if (fam == kFamDrywall) {
+        a = base * (0.94 + 0.10 * fbm(float2(along * 0.6, p.y * 0.6)));
+        a *= 1.0 - 0.16 * smoothstep(0.55, 0.0, p.y);
+        // Chair rail: the band where trolleys and chair backs have hit the board
+        float rail = smoothstep(0.10, 0.0, fabs(p.y - 0.76));
+        a *= 1.0 - L.wallParam * 0.35 * rail * (0.4 + 0.6 * fbm(float2(along * 4.0, 1.7)));
+        float scuff = smoothstep(0.62, 0.90, fbm(float2(along * 2.2, p.y * 0.8) + 2.3))
+                    * smoothstep(1.3, 0.3, p.y);
+        a *= 1.0 - L.wallParam * 0.45 * scuff;
+        s.glossAmt = 0.04;
+        s.bumpAmt = 0.06;
+    } else if (fam == kFamConcrete) {
+        if (kind == 0) {
+            a = base * (0.85 + 0.25 * fbm(p.xz * 1.3));
+            s.glossAmt = 0.10; s.bumpAmt = 0.28;
+        } else if (kind == 1) {
+            a = base * (0.9 + 0.2 * fbm(p.xz * 0.9));
+            s.glossAmt = 0.05; s.bumpAmt = 0.12;
+        } else {
+            a = base * (0.80 + 0.30 * fbm(float2(along, p.y) * 1.7));
             a *= 1.0 - 0.35 * smoothstep(1.2, 0.0, p.y) * fbm(float2(along * 0.8, 3.1));
+            s.glossAmt = 0.05; s.bumpAmt = 0.50;
         }
-        s.albedo += w.y * a;
-        s.glossAmt += w.y * (kind == 0 ? 0.10 : 0.05);
-        s.bumpAmt += w.y * (kind == 2 ? 0.50 : (kind == 0 ? 0.28 : 0.12));
-    }
-
-    if (w.z > 0.004) {
-        float3 a;
+    } else if (fam == kFamTile) {
         float2 tc = (kind == 2) ? float2(along, p.y) : p.xz;
-        float pitch = (kind == 2) ? 0.30 : 0.50;
+        float pitch = (kind == 2) ? L.wallParam : L.floorParam;
         float2 g = abs(fract(tc / pitch) - 0.5) * pitch;
         float grout = smoothstep(0.021, 0.012, min(g.x, g.y));
         float tint = 0.92 + 0.16 * vhash(floor(tc / pitch));
-        float3 tile = (kind == 2) ? float3(0.78, 0.82, 0.85) : float3(0.66, 0.72, 0.76);
-        if (kind == 1) tile = float3(0.74, 0.77, 0.80);
-        a = mix(tile * tint, float3(0.42, 0.45, 0.47), grout);
+        a = mix(base * tint, float3(0.42, 0.45, 0.47), grout);
         if (kind == 2 && waterY > -0.1) {   // old waterline stain on the tile
             a *= 1.0 - 0.28 * exp(-fabs(p.y - (waterY + 0.05)) * 22.0);
         }
-        s.albedo += w.z * a;
-        s.glossAmt += w.z * (kind == 0 ? 0.55 : 0.40);
+        s.glossAmt = (kind == 0) ? 0.55 : 0.40;
         s.glossPow = 70.0;
-        s.bumpAmt += w.z * (kind == 2 ? 0.05 : 0.02);
+        s.bumpAmt = (kind == 2) ? 0.05 : 0.02;
+    } else if (fam == kFamAcoustic) {
+        a = base * (0.95 + 0.09 * vhash(floor(p.xz)));
+        a *= 1.0 - 0.10 * smoothstep(0.78, 0.92, vnoise(p.xz * 34.0));
+        float2 g = abs(fract(p.xz) - 0.5);
+        a *= 1.0 - 0.22 * smoothstep(0.47, 0.5, max(g.x, g.y));
+    } else if (fam == kFamPlaster) {
+        a = base * (0.95 + 0.09 * fbm(p.xz * 1.1));
+        s.glossAmt = 0.02;
+        s.bumpAmt = 0.05;
+    } else if (fam == kFamWood) {
+        // Real grain if we have it, stretched fbm if not, plus panel divisions
+        if (hasWood > 0.5) {
+            float gr = woodTex.sample(wallSampler, float2(along, p.y) * kWoodTexScale).r;
+            a = base * (0.62 + 0.78 * gr);
+        } else {
+            a = base * (0.78 + 0.44 * fbm(float2(along * 1.4, p.y * 22.0)));
+        }
+        float seam = smoothstep(0.035, 0.012, fabs(fract(along / 0.80) - 0.5) * 0.80);
+        a *= 1.0 - 0.35 * seam;
+        s.glossAmt = 0.16;
+        s.glossPow = 40.0;
+        s.bumpAmt = 0.10;
+    } else {   // kFamPaint - skirting board
+        a = base * (0.9 + 0.2 * vnoise(float2(along * 30.0, p.y * 60.0)));
     }
 
+    s.albedo = a;
     return s;
 }
 
-static float3 panelEmission(int2 pc, float3 w, float t, float globalLight, uint seed,
-                            thread float2 &ext)
+// Blend the two live levels. When holding (t == 0) only one is evaluated.
+static Surface surfaceAt(float3 p, float3 n, int kind, thread const LevelMix &L, float waterY,
+                         texture2d<float> wallTex, float hasTex,
+                         texture2d<float> woodTex, float hasWood, MapCfg cfg)
+{
+    float along = (abs(n.x) > 0.5) ? p.z : p.x;
+    Surface s = materialFor(L.ia, kind, p, n, along, waterY, wallTex, hasTex, woodTex, hasWood, cfg);
+    if (L.t > 0.004) {
+        Surface o = materialFor(L.ib, kind, p, n, along, waterY, wallTex, hasTex, woodTex, hasWood, cfg);
+        s.albedo = mix(s.albedo, o.albedo, L.t);
+        s.glossAmt = mix(s.glossAmt, o.glossAmt, L.t);
+        s.glossPow = mix(s.glossPow, o.glossPow, L.t);
+        s.bumpAmt = mix(s.bumpAmt, o.bumpAmt, L.t);
+    }
+    return s;
+}
+
+// Everything panelEmission needs, resolved once per fragment: the light loop
+// calls it ten times per shaded pixel, so the level lookups and the horror
+// thresholds are hoisted out rather than recomputed on every call.
+struct PanelCfg {
+    float3 lightA, lightB;
+    float probA, probB;
+    float2 extA, extB;
+    float t, motion;
+    float deadT, buzzT, badT;
+};
+
+static PanelCfg resolvePanels(thread const LevelMix &L)
+{
+    constant LevelDef &A = kLevels[L.ia];
+    constant LevelDef &B = kLevels[L.ib];
+    PanelCfg P;
+    P.lightA = A.lightCol;  P.lightB = B.lightCol;
+    P.probA = A.panelProb;  P.probB = B.panelProb;
+    P.extA = A.panelExt;    P.extB = B.panelExt;
+    P.t = L.t;
+    P.motion = mix(A.motion, B.motion, L.t);
+    // Horror widens both tails: more dead tubes, more of them buzzing.
+    P.deadT = mix(0.05, 0.16, L.horror);
+    P.buzzT = mix(0.93, 0.75, L.horror);
+    P.badT  = mix(0.72, 0.35, L.horror);
+    return P;
+}
+
+static float3 panelEmission(int2 pc, thread const PanelCfg &P, float t, float globalLight,
+                            uint seed, float2 mCen, float2 mFwd, thread float2 &ext)
 {
     float h = hcell(pc, kSaltPanel, seed);
     float3 c = float3(0);
-    for (int i = 0; i < 3; ++i)
-        if (w[i] > 0.004 && h < kPanelProb[i]) c += w[i] * kLightCol[i];
+    if (h < P.probA) c += (1.0 - P.t) * P.lightA;
+    if (h < P.probB) c += P.t * P.lightB;
 
-    ext = w.x * kPanelExt[0] + w.y * kPanelExt[1] + w.z * kPanelExt[2];
+    ext = mix(P.extA, P.extB, P.t);
     if (hcell(pc, kSaltOrient, seed) < 0.5) ext = ext.yx;
 
     if (dot(c, c) < 1e-6) return float3(0);
 
     float fh = hcell(pc, kSaltFlick, seed);
     float b = 1.0;
-    if (fh < 0.05) {
+    if (fh < P.deadT) {
         b = 0.04;                                   // the dead one down the hall
-    } else if (fh > 0.93) {
+    } else if (fh > P.buzzT) {
         // Episodic trouble: steady most of the time, then a stretch of
         // buzzing every half minute or so.
         float window = floor(t / 11.0 + fh * 53.0);
-        float bad = step(0.72, vhash(float2(window, fh * 191.0)));
+        float bad = step(P.badT, vhash(float2(window, fh * 191.0)));
         float n = step(0.45, vhash(float2(floor(t * 5.5), fh * 371.0)));
         b = mix(1.0, 0.5 + 0.5 * n, bad * 0.9);
+    }
+
+    float motion = P.motion;
+    if (motion > 0.001) {
+        // Level 94: panels wake as the walker approaches. The ramp is centred
+        // behind them, so lights ignite ahead and linger a beat after they pass
+        // - stateless, but it reads exactly like switching lag.
+        float2 lc = (float2(pc) + 0.5) * kPanelPitch;
+        float d = distance(lc, mCen - mFwd * 2.2);
+        float r = 7.0 + 2.6 * hcell(pc, kSaltMotion, seed);   // ragged, not a clean circle
+        float on = smoothstep(r, r - 2.4, d);
+        // Fluorescent strike: a stutter or two right at the threshold
+        float settled = smoothstep(r - 0.6, r - 2.0, d);
+        float strike = step(0.42, vhash(float2(floor(t * 9.0), h * 613.0)));
+        on *= mix(strike, 1.0, settled);
+        // A few tubes never went out. Without them the rooms nobody is walking
+        // through are pure black, and a CCTV shot has nothing in it at all.
+        float keep = (hcell(pc, kSaltMotion, seed ^ 0x5BD1u) < 0.22) ? 0.16 : 0.015;
+        b *= mix(1.0, max(on, keep), motion);
     }
     return c * b * globalLight;
 }
@@ -419,10 +656,14 @@ static float softShadow(float3 p, float3 L, float dist, MapCfg cfg)
     return clamp(res, 0.0, 1.0);
 }
 
-static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float globalLight,
+static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, float t, float globalLight,
                     float waterY, bool primary, texture2d<float> wallTex, float hasTex,
-                    MapCfg cfg)
+                    texture2d<float> woodTex, float hasWood,
+                    float2 mCen, float2 mFwd, MapCfg cfg)
 {
+    constant LevelDef &A = kLevels[L.ia];
+    constant LevelDef &B = kLevels[L.ib];
+    PanelCfg P = resolvePanels(L);
     int kind = 2;
     if (n.y > 0.6 && p.y < 1.0) kind = 0;
     else if (n.y < -0.6) kind = 1;
@@ -431,7 +672,7 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
     if (kind == 1 && p.y > cfg.ceilH - 0.05) {
         int2 pc = int2(floor(p.xz / kPanelPitch));
         float2 ext;
-        float3 em = panelEmission(pc, w, t, globalLight, cfg.seed, ext);
+        float3 em = panelEmission(pc, P, t, globalLight, cfg.seed, mCen, mFwd, ext);
         float2 lc = (float2(pc) + 0.5) * kPanelPitch;
         float2 dxz = abs(p.xz - lc);
         if (dot(em, em) > 1e-6 && dxz.x < ext.x && dxz.y < ext.y) {
@@ -443,17 +684,19 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
         }
     }
 
-    Surface s = surfaceAt(p, n, kind, w, waterY, wallTex, hasTex, cfg);
+    Surface s = surfaceAt(p, n, kind, L, waterY, wallTex, hasTex, woodTex, hasWood, cfg);
 
-    // Real woodchip relief bump on Level 0 walls
-    if (hasTex > 0.5 && kind == 2 && w.x > 0.004) {
+    // Real woodchip relief bump, wherever the live mix uses wallpaper
+    float paper = (A.wallFam == kFamPaper ? 1.0 - L.t : 0.0)
+                + (B.wallFam == kFamPaper ? L.t : 0.0);
+    if (hasTex > 0.5 && kind == 2 && paper > 0.004) {
         float2 wuv = float2((fabs(n.x) > 0.5) ? p.z : p.x, p.y) * kWallTexScale;
         const float te = 0.008;
         float h0 = wallTex.sample(wallSampler, wuv).r;
         float hx = wallTex.sample(wallSampler, wuv + float2(te, 0)).r;
         float hy = wallTex.sample(wallSampler, wuv + float2(0, te)).r;
         float3 uA = (fabs(n.x) > 0.5) ? float3(0, 0, 1) : float3(1, 0, 0);
-        n = normalize(n - (uA * (hx - h0) + float3(0, 1, 0) * (hy - h0)) * (w.x * 2.0));
+        n = normalize(n - (uA * (hx - h0) + float3(0, 1, 0) * (hy - h0)) * (paper * 2.0));
     }
 
     // Procedural bump: perturb the normal with an fbm gradient in the plane
@@ -472,7 +715,8 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
     float ao = calcAO(p, n, cfg);
     float3 V = -rd;
 
-    float3 col = s.albedo * (w.x * kAmb[0] + w.y * kAmb[1] + w.z * kAmb[2]) * (0.35 + 0.65 * ao);
+    float3 amb = mixCol(L, A.amb, B.amb) * mix(1.0, 0.55, L.horror);
+    float3 col = s.albedo * amb * (0.35 + 0.65 * ao);
 
     float bestLum = 0.0, bestDist = 0.0;
     float3 bestAdd = float3(0), bestL = float3(0, 1, 0);
@@ -482,7 +726,7 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
     for (int dx = -1; dx <= 1; ++dx) {
         int2 pc = pcc + int2(dx, dz);
         float2 ext;
-        float3 em = panelEmission(pc, w, t, globalLight, cfg.seed, ext);
+        float3 em = panelEmission(pc, P, t, globalLight, cfg.seed, mCen, mFwd, ext);
         if (dot(em, em) < 1e-6) continue;
         float2 lc = (float2(pc) + 0.5) * kPanelPitch;
         float3 lp = float3(lc.x, cfg.ceilH - 0.07, lc.y);
@@ -518,20 +762,93 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
 
     // Caustic shimmer on submerged floor
     if (kind == 0 && waterY > 0.02) {
+        float wet = smoothstep(0.02, 0.16, waterY);
         float ca = fbm(p.xz * 1.8 + float2(t * 0.23, -t * 0.17));
-        col *= 1.0 + w.z * 2.2 * pow(ca, 3.0);
+        col *= 1.0 + wet * 2.2 * pow(ca, 3.0);
     }
 
     col *= 0.55 + 0.45 * ao;
     return col;
 }
 
-static float3 applyFog(float3 col, float t, float3 w, float2 q, float time)
+static float3 fogColour(thread const LevelMix &L)
 {
-    float den = dot(w, float3(kFogDen[0], kFogDen[1], kFogDen[2]));
+    return mixCol(L, kLevels[L.ia].fogCol, kLevels[L.ib].fogCol);
+}
+
+static float3 applyFog(float3 col, float t, thread const LevelMix &L, float2 q, float time)
+{
+    constant LevelDef &A = kLevels[L.ia];
+    constant LevelDef &B = kLevels[L.ib];
+    float den = mixF(L, A.fogDen, B.fogDen) * mix(1.0, 1.45, L.horror);
     den *= 0.72 + 0.55 * fbm(q * 0.09 + time * 0.02);   // patchy, slowly drifting haze
-    float3 fog = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
-    return mix(col, fog, 1.0 - exp(-t * den));
+    return mix(col, fogColour(L), 1.0 - exp(-t * den));
+}
+
+// ---------------------------------------------------------------------------
+// Entities (horror only).
+//
+// Deliberately NOT part of map(): they are a post-march overlay, depth-tested
+// against the primary hit. So they cost no march steps, can never block the
+// camera, and cannot touch the passability contract the path planner relies on.
+// Director.swift owns spawning, lifetime and fade, and passes at most one.
+// ---------------------------------------------------------------------------
+
+static float smilerMask(float2 uv)
+{
+    // Grin: a band following a parabola that opens upward, so the corners of
+    // the mouth sit above its centre, broken into teeth.
+    float yc = -0.30 + 0.62 * uv.x * uv.x;
+    float mouth = smoothstep(0.16, 0.10, fabs(uv.y - yc))
+                * smoothstep(0.62, 0.52, fabs(uv.x));
+    float teeth = smoothstep(0.30, 0.46, fabs(fract(uv.x * 8.0) - 0.5) * 2.0);
+    mouth *= 0.30 + 0.70 * teeth;
+    // Eyes: two crescents, flat side down
+    float2 e = float2(fabs(uv.x) - 0.30, uv.y - 0.42);
+    float eye = smoothstep(0.16, 0.09, length(e * float2(1.0, 1.5)))
+              * smoothstep(-0.04, 0.06, e.y + 0.11);
+    return clamp(mouth + eye, 0.0, 1.0);
+}
+
+static float figureMask(float2 uv)
+{
+    float head = smoothstep(0.17, 0.13, length((uv - float2(0.0, 0.70)) * float2(1.15, 1.0)));
+    float body = smoothstep(0.31, 0.26, length((uv - float2(0.0, -0.18)) * float2(1.0, 0.40)));
+    return clamp(head + body, 0.0, 1.0);
+}
+
+static float3 applyEntity(float3 col, float3 ro, float3 rd, float tHit,
+                          float4 entPos, float4 entCfg, thread const LevelMix &L, float time)
+{
+    constant LevelDef &A = kLevels[L.ia];
+    constant LevelDef &B = kLevels[L.ib];
+    float alpha = entPos.w;
+    if (alpha < 0.002) return col;
+
+    float3 toE = entPos.xyz - ro;
+    float d = dot(toE, rd);
+    if (d < 0.6 || d > tHit) return col;        // behind us, or behind a wall
+
+    float3 off = ro + rd * d - entPos.xyz;
+    float3 right = normalize(cross(rd, float3(0, 1, 0)));
+    float3 up = normalize(cross(right, rd));
+    float2 uv = float2(dot(off, right), dot(off, up)) / max(entCfg.y, 0.05);
+    if (max(fabs(uv.x), fabs(uv.y)) > 1.3) return col;
+
+    float den = mixF(L, A.fogDen, B.fogDen);
+    if (entCfg.x < 0.5) {
+        // Smiler: emissive, so the bloom chain gives it a halo in the haze
+        float m = smilerMask(uv);
+        if (m < 0.002) return col;
+        float flick = 0.82 + 0.18 * vhash(float2(floor(time * 7.0), entCfg.z));
+        float3 glow = float3(0.95, 0.93, 0.80) * (2.6 * m * alpha * flick);
+        return col + glow * exp(-d * den * 0.85);
+    }
+    // Figure: a hole in the haze, read as an absence rather than an object
+    float m = figureMask(uv);
+    if (m < 0.002) return col;
+    float3 fog = fogColour(L);
+    return mix(col, mix(fog * 0.22, fog, 1.0 - exp(-d * den)), m * alpha);
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +871,8 @@ vertex FSOut fullscreen_vs(uint vid [[vertex_id]])
 
 fragment float4 backrooms_fs(FSOut in [[stage_in]],
                              constant RMUniforms &U [[buffer(0)]],
-                             texture2d<float> wallTex [[texture(0)]])
+                             texture2d<float> wallTex [[texture(0)]],
+                             texture2d<float> woodTex [[texture(1)]])
 {
     float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y);
     float3 ro = U.eyeTime.xyz;
@@ -562,22 +880,31 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
                           + U.rightTanX.xyz * (ndc.x * U.rightTanX.w)
                           + U.upTanY.xyz * (ndc.y * U.upTanY.w));
 
-    float3 w = U.level.xyz;
+    LevelMix L;
+    L.ia = clamp(int(U.level.x), 0, 5);
+    L.ib = clamp(int(U.level.y), 0, 5);
+    L.t = clamp(U.level.z, 0.0, 1.0);
+    L.horror = clamp(U.horror.x, 0.0, 1.0);
+    constant LevelDef &A = kLevels[L.ia];
+    constant LevelDef &B = kLevels[L.ib];
+
     float t = U.eyeTime.w;
     float waterY = U.level.w;
     float globalLight = U.mode.y;
 
     MapCfg cfg;
     cfg.ceilH = U.mode.z;
-    cfg.doorW = dot(w, float3(1.5, 2.3, 1.9));
-    cfg.doorH = dot(w, float3(2.25, 2.6, 3.1));
-    cfg.doorR = dot(w, float3(0.03, 0.06, 0.80));
-    cfg.pillarR = dot(w, float3(0.16, 0.45, 0.40));
-    cfg.roundness = w.z;
-    cfg.skirt = 0.016 * w.x;
-    cfg.leanAmt = dot(w, float3(0.06, 0.22, 0.05));
-    cfg.partProb = dot(w, float3(0.30, 0.35, 0.15));
-    cfg.soffitProb = dot(w, float3(0.25, 0.30, 0.15));
+    cfg.doorW = mixF(L, A.doorW, B.doorW);
+    cfg.doorH = mixF(L, A.doorH, B.doorH);
+    cfg.doorR = mixF(L, A.doorR, B.doorR);
+    cfg.pillarR = mixF(L, A.pillarR, B.pillarR);
+    cfg.roundness = mixF(L, A.roundness, B.roundness);
+    cfg.skirt = mixF(L, A.skirt, B.skirt);
+    cfg.wainscotH = mixF(L, A.wainscotH, B.wainscotH);
+    cfg.wainscotInv = 1.0 / (cfg.wainscotH * 0.35 - cfg.wainscotH);
+    cfg.leanAmt = mixF(L, A.leanAmt, B.leanAmt);
+    cfg.partProb = mixF(L, A.partProb, B.partProb);
+    cfg.soffitProb = mixF(L, A.soffitProb, B.soffitProb);
     cfg.seed = as_type<uint>(U.fwdSeed.w);
 
     bool hit;
@@ -587,10 +914,11 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
         float3 p = ro + rd * tHit;
         float3 n = calcNormal(p, cfg);
         float2 fq = (ro + rd * min(tHit, 14.0)).xz;
-        col = applyFog(shade(p, n, rd, w, t, globalLight, waterY, true, wallTex, U.mode.w, cfg),
-                       tHit, w, fq, t);
+        col = applyFog(shade(p, n, rd, L, t, globalLight, waterY, true, wallTex, U.mode.w,
+                             woodTex, U.horror.y, U.motion.xy, U.motion.zw, cfg),
+                       tHit, L, fq, t);
     } else {
-        col = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
+        col = fogColour(L);
     }
 
     // Water plane: reflect one bounce, absorb what is underneath.
@@ -628,11 +956,12 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
             if (rhit) {
                 float3 rp = wp + normalize(rrd) * rt;
                 float3 rn = calcNormal(rp, cfg);
-                rcol = applyFog(shade(rp, rn, normalize(rrd), w, t, globalLight, waterY, false,
-                                      wallTex, U.mode.w, cfg),
-                                tw + rt, w, wp.xz, t);
+                rcol = applyFog(shade(rp, rn, normalize(rrd), L, t, globalLight, waterY, false,
+                                      wallTex, U.mode.w, woodTex, U.horror.y,
+                                      U.motion.xy, U.motion.zw, cfg),
+                                tw + rt, L, wp.xz, t);
             } else {
-                rcol = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
+                rcol = fogColour(L);
             }
             rcol = min(rcol, float3(3.5));   // tame reflected-panel sparkle
 
@@ -641,9 +970,11 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
             float3 under = col * absorb * 0.85;
             float fres = 0.03 + 0.97 * pow(1.0 - max(dot(-rd, nW), 0.0), 5.0);
             col = mix(under, rcol, clamp(fres * 1.9, 0.0, 1.0));
+            tHit = min(tHit, tw);   // the water surface is what we actually see
         }
     }
 
+    col = applyEntity(col, ro, rd, tHit, U.entPos, U.entCfg, L, t);
     return float4(col, 1.0);
 }
 
