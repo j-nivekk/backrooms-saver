@@ -84,7 +84,28 @@ swiftc -O -target "$TARGET" \
 "$BUILD/verify-bundle" "$SAVER"
 
 # ---------------------------------------------------------------------------
-# 5. Optional install
+# 5. Optional distributable: universal (arm64 + x86_64) binary, zipped
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "dist" ]]; then
+  echo "==> compiling x86_64 slice"
+  swiftc -O -wmo -target "x86_64-apple-macos13.0" \
+    -module-name "${NAME}Saver" \
+    -emit-library -Xlinker -bundle \
+    -framework ScreenSaver -framework MetalKit -framework Metal -framework AppKit \
+    -o "$BUILD/$NAME-x86_64" \
+    "${SOURCES[@]}" "$ROOT"/Sources/Saver/*.swift
+  lipo -create "$SAVER/Contents/MacOS/$NAME" "$BUILD/$NAME-x86_64" \
+       -output "$SAVER/Contents/MacOS/$NAME.universal"
+  mv "$SAVER/Contents/MacOS/$NAME.universal" "$SAVER/Contents/MacOS/$NAME"
+  rm -f "$BUILD/$NAME-x86_64"
+  codesign --force --sign - --timestamp=none "$SAVER" >/dev/null 2>&1
+  lipo -info "$SAVER/Contents/MacOS/$NAME"
+  ditto -c -k --keepParent "$SAVER" "$BUILD/$NAME.saver.zip"
+  echo "==> wrote $BUILD/$NAME.saver.zip"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Optional install
 # ---------------------------------------------------------------------------
 if [[ "${1:-}" == "install" ]]; then
   mkdir -p "$INSTALL_DIR"
