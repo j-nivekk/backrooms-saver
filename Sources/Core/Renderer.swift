@@ -63,7 +63,7 @@ public final class BackroomsRenderer {
         self.device = device
         guard let queue = device.makeCommandQueue() else { throw RendererError.noDevice }
         commandQueue = queue
-        internalScale = preview ? 1.0 : 0.5
+        internalScale = preview ? 1.0 : 0.6
         director = Director(seed: seed, preview: preview)
 
         let lib: MTLLibrary
@@ -202,7 +202,8 @@ public final class BackroomsRenderer {
         var comp = GPUComposite(
             params: SIMD4(f.fade, 1.12, time * 61.7, 0.9),
             cctv: SIMD4(f.cctv, f.glitch, time, 0),
-            res: SIMD4(Float(target.width), Float(target.height), 0, 0),
+            res: SIMD4(Float(target.width), Float(target.height),
+                       Float(internalSize.x), Float(internalSize.y)),
             textA: ta, textB: tb)
         pass(commandBuffer, label: "composite", pipeline: compositePipeline, target: target,
              inputs: [hdr, bloomA, bloomC]) { enc in

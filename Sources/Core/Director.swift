@@ -298,6 +298,8 @@ public final class Director {
         phaseT = preview ? 14 : 34
         fadeStart = -0.7          // fade in from black on launch
         pendingTeleport = false
+        levelCur = Int.random(in: 0...2, using: &rng)
+        levelT = holdDuration() * Float.random(in: 0.3...1.0, using: &rng)
     }
 
     private func startDrift(teleport: Bool) {
@@ -371,6 +373,35 @@ public final class Director {
     }
 
     // MARK: - Level timeline
+    // Randomised schedule: a random starting mood each launch, held for a
+    // random stretch, then a smooth transition to a randomly chosen other
+    // mood. No fixed lap order.
+
+    private var levelCur = 0
+    private var levelNext = 0
+    private var levelHolding = true
+    private var levelT: Float = 0
+    private var levelTransLen: Float = 30
+
+    private func holdDuration() -> Float {
+        preview ? Float.random(in: 25...45, using: &rng)
+                : Float.random(in: 90...160, using: &rng)
+    }
+
+    private func updateLevels(_ dt: Float) {
+        levelT -= dt
+        guard levelT <= 0 else { return }
+        if levelHolding {
+            levelNext = ([0, 1, 2].filter { $0 != levelCur }).randomElement(using: &rng)!
+            levelTransLen = preview ? 16 : 32
+            levelT = levelTransLen
+            levelHolding = false
+        } else {
+            levelCur = levelNext
+            levelT = holdDuration()
+            levelHolding = true
+        }
+    }
 
     private func levelWeights() -> SIMD3<Float> {
         if let f = forcedLevel {
@@ -378,21 +409,22 @@ public final class Director {
             w[min(max(f, 0), 2)] = 1
             return w
         }
-        let ph = (time / 165.0).truncatingRemainder(dividingBy: 3.0)
         var w = SIMD3<Float>(0, 0, 0)
-        for i in 0..<3 {
-            let d0 = abs(ph - Float(i))
-            let d = min(d0, 3 - d0)
-            w[i] = 1 - smoothstep(0.40, 0.62, d)
+        if levelHolding {
+            w[levelCur] = 1
+        } else {
+            let s = smoothstep(0, 1, 1 - levelT / levelTransLen)
+            w[levelCur] = 1 - s
+            w[levelNext] = s
         }
-        let s = w.x + w.y + w.z
-        return s > 1e-4 ? w / s : SIMD3(1, 0, 0)
+        return w
     }
 
     // MARK: - Update / frame
 
     public func update(deltaTime dt: Float) {
         time += dt
+        updateLevels(dt)
         phaseT -= dt
         if phaseT <= 0 { advanceShot() }
 
@@ -450,7 +482,7 @@ public final class Director {
 
         // Occasional building-wide power sag
         let dip = powf(max(0, sinf(time * 0.53) * sinf(time * 1.31 + 1.7) * sinf(time * 0.187 + 0.5)), 24)
-        f.globalLight = 1 - 0.10 * dip + 0.02 * sinf(time * 6.1)
+        f.globalLight = 1 - 0.07 * dip + 0.008 * sinf(time * 2.3)
 
         f.glitch = max(0, 1 - (time - glitchAt) / 0.35)
 

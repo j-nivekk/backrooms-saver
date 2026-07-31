@@ -45,6 +45,7 @@ constant uint kSaltPanel   = 0xD3A2646Cu;
 constant uint kSaltOrient  = 0x85EBCA6Bu;
 constant uint kSaltFlick   = 0xFD7046C5u;
 constant uint kSaltPillar  = 0xB55A4F09u;
+constant uint kSaltTint    = 0x7C3A11B7u;
 
 static uint uhash(uint h)
 {
@@ -102,7 +103,7 @@ static float fbm(float2 p)
 // ---------------------------------------------------------------------------
 
 struct MapCfg {
-    float ceilH, doorW, doorH, doorR, pillarR, roundness;
+    float ceilH, doorW, doorH, doorR, pillarR, roundness, skirt;
     uint seed;
 };
 
@@ -117,7 +118,9 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
     float along = (axis == 0) ? p.z : p.x;
     float perp  = (axis == 0) ? p.x : p.z;
     float aL = along - alongOrigin;
-    float d = max(abs(perp - lineC) - kHalfT, abs(aL - kCell * 0.5) - kCell * 0.5);
+    // Skirting board: the wall fattens slightly near the floor
+    float halfT = kHalfT + cfg.skirt * smoothstep(0.13, 0.05, p.y);
+    float d = max(abs(perp - lineC) - halfT, abs(aL - kCell * 0.5) - kCell * 0.5);
 
     if (edgeHash(e, axis, kSaltDoor, cfg.seed) < doorProb) {
         float frac = mix(0.28, 0.72, edgeHash(e, axis, kSaltDoorPos, cfg.seed));
@@ -218,24 +221,32 @@ struct Surface {
     float3 albedo;
     float glossAmt;
     float glossPow;
+    float bumpAmt;
 };
 
 // kind: 0 floor, 1 ceiling, 2 wall
-static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, MapCfg cfg)
+static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, float waterY, MapCfg cfg)
 {
     Surface s;
     s.albedo = float3(0);
     s.glossAmt = 0.0;
     s.glossPow = 24.0;
+    s.bumpAmt = 0.0;
 
     float along = (abs(n.x) > 0.5) ? p.z : p.x;
 
     if (w.x > 0.004) {
         float3 a;
         if (kind == 0) {
+            // Carpet: coarse mottling, fine fibre noise, big damp blotches
+            float fibers = 0.92 + 0.16 * vnoise(p.xz * 34.0);
+            float blotch = smoothstep(0.60, 0.88, fbm(p.xz * 0.33 + 7.3));
             a = float3(0.40, 0.335, 0.170) * (0.85 + 0.30 * fbm(p.xz * 6.0));
+            a *= fibers * (1.0 - 0.22 * blotch);
         } else if (kind == 1) {
-            a = float3(0.66, 0.65, 0.58);
+            // Acoustic tiles: per-tile tint drift, speckle, grid grooves
+            a = float3(0.66, 0.65, 0.58) * (0.95 + 0.09 * vhash(floor(p.xz)));
+            a *= 1.0 - 0.10 * smoothstep(0.78, 0.92, vnoise(p.xz * 34.0));
             float2 g = abs(fract(p.xz) - 0.5);
             a *= 1.0 - 0.22 * smoothstep(0.47, 0.5, max(g.x, g.y));
         } else {
@@ -245,9 +256,19 @@ static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, MapCfg cfg)
             float grimeHi = smoothstep(cfg.ceilH - 0.45, cfg.ceilH, p.y);
             float stain = smoothstep(0.55, 0.85, fbm(float2(along * 0.45, p.y * 0.45)));
             a *= 1.0 - 0.32 * grimeLo - 0.18 * grimeHi - 0.28 * stain;
+            // Paper grain, scuff streaks, and a per-region tint of the yellow
+            a *= 0.96 + 0.07 * vnoise(float2(along, p.y) * 48.0);
+            float scuff = smoothstep(0.60, 0.88, fbm(float2(along * 2.5, p.y * 0.7) + 4.2))
+                        * smoothstep(1.1, 0.35, p.y);
+            a *= 1.0 - 0.20 * scuff;
+            a *= 0.93 + 0.14 * hcell(int2(floor(floor(p.xz / kCell) / 6.0)), kSaltTint, cfg.seed);
+            if (p.y < 0.115) {   // skirting board paint
+                a = float3(0.30, 0.24, 0.12) * (0.9 + 0.2 * vnoise(float2(along * 30.0, p.y * 60.0)));
+            }
         }
         s.albedo += w.x * a;
         s.glossAmt += w.x * (kind == 2 ? 0.03 : 0.0);
+        s.bumpAmt += w.x * (kind == 2 ? 0.10 : (kind == 0 ? 0.06 : 0.0));
     }
 
     if (w.y > 0.004) {
@@ -262,6 +283,7 @@ static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, MapCfg cfg)
         }
         s.albedo += w.y * a;
         s.glossAmt += w.y * (kind == 0 ? 0.10 : 0.05);
+        s.bumpAmt += w.y * (kind == 2 ? 0.50 : (kind == 0 ? 0.28 : 0.12));
     }
 
     if (w.z > 0.004) {
@@ -274,9 +296,13 @@ static Surface surfaceAt(float3 p, float3 n, int kind, float3 w, MapCfg cfg)
         float3 tile = (kind == 2) ? float3(0.78, 0.82, 0.85) : float3(0.66, 0.72, 0.76);
         if (kind == 1) tile = float3(0.74, 0.77, 0.80);
         a = mix(tile * tint, float3(0.42, 0.45, 0.47), grout);
+        if (kind == 2 && waterY > -0.1) {   // old waterline stain on the tile
+            a *= 1.0 - 0.28 * exp(-fabs(p.y - (waterY + 0.05)) * 22.0);
+        }
         s.albedo += w.z * a;
         s.glossAmt += w.z * (kind == 0 ? 0.55 : 0.40);
         s.glossPow = 70.0;
+        s.bumpAmt += w.z * (kind == 2 ? 0.05 : 0.02);
     }
 
     return s;
@@ -299,15 +325,31 @@ static float3 panelEmission(int2 pc, float3 w, float t, float globalLight, uint 
     float b = 1.0;
     if (fh < 0.05) {
         b = 0.04;                                   // the dead one down the hall
-    } else if (fh > 0.86) {
-        float n = step(0.4, vhash(float2(floor(t * (9.0 + fh * 10.0)), fh * 371.0)));
-        b = mix(1.0, 0.45 + 0.55 * n, 0.85);        // buzzing, undecided
+    } else if (fh > 0.93) {
+        // Episodic trouble: steady most of the time, then a stretch of
+        // buzzing every half minute or so.
+        float window = floor(t / 11.0 + fh * 53.0);
+        float bad = step(0.72, vhash(float2(window, fh * 191.0)));
+        float n = step(0.45, vhash(float2(floor(t * 5.5), fh * 371.0)));
+        b = mix(1.0, 0.5 + 0.5 * n, bad * 0.9);
     }
     return c * b * globalLight;
 }
 
+static float softShadow(float3 p, float3 L, float dist, MapCfg cfg)
+{
+    float res = 1.0, t = 0.06;
+    for (int i = 0; i < 8; ++i) {
+        if (t > dist - 0.15) break;
+        float d = map(p + L * t, cfg);
+        res = min(res, 8.0 * d / t);
+        t += clamp(d, 0.06, 0.55);
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
 static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float globalLight,
-                    float waterY, MapCfg cfg)
+                    float waterY, bool primary, MapCfg cfg)
 {
     int kind = 2;
     if (n.y > 0.6 && p.y < 1.0) kind = 0;
@@ -329,11 +371,28 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
         }
     }
 
-    Surface s = surfaceAt(p, n, kind, w, cfg);
+    Surface s = surfaceAt(p, n, kind, w, waterY, cfg);
+
+    // Procedural bump: perturb the normal with an fbm gradient in the plane
+    if (s.bumpAmt > 0.005) {
+        float2 tp = (kind == 2) ? float2((fabs(n.x) > 0.5) ? p.z : p.x, p.y) : p.xz;
+        const float freq = 2.6, e = 0.05;
+        float2 g = float2(fbm(tp * freq + float2(e, 0)) - fbm(tp * freq - float2(e, 0)),
+                          fbm(tp * freq + float2(0, e)) - fbm(tp * freq - float2(0, e)))
+                 * (0.5 / e);
+        float3 uA = (kind == 2) ? ((fabs(n.x) > 0.5) ? float3(0, 0, 1) : float3(1, 0, 0))
+                                : float3(1, 0, 0);
+        float3 vA = (kind == 2) ? float3(0, 1, 0) : float3(0, 0, 1);
+        n = normalize(n - (uA * g.x + vA * g.y) * (s.bumpAmt * 0.08));
+    }
+
     float ao = calcAO(p, n, cfg);
     float3 V = -rd;
 
     float3 col = s.albedo * (w.x * kAmb[0] + w.y * kAmb[1] + w.z * kAmb[2]) * (0.35 + 0.65 * ao);
+
+    float bestLum = 0.0, bestDist = 0.0;
+    float3 bestAdd = float3(0), bestL = float3(0, 1, 0);
 
     int2 pcc = int2(floor(p.xz / kPanelPitch));
     for (int dz = -1; dz <= 1; ++dz)
@@ -349,13 +408,29 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
         float3 L = toL * rsqrt(max(d2, 1e-5));
         float nl = clamp(dot(n, L) * 0.62 + 0.38, 0.0, 1.0);
         float atten = 1.0 / (1.0 + d2 * 0.32);
-        float range = clamp(1.0 - d2 / 46.0, 0.0, 1.0);
-        col += s.albedo * em * (0.055 * nl * atten * range);
+        // Falloff must reach zero before a light can leave the 3x3 window
+        // (1.5 * panel pitch horizontally), or seams appear on the floor.
+        float2 hv = lc - p.xz;
+        float range = clamp(1.0 - dot(hv, hv) / 9.0, 0.0, 1.0);
+        range *= range;
+        float3 add = s.albedo * em * (0.075 * nl * atten * range);
         if (s.glossAmt > 0.005) {
             float3 H = normalize(L + V);
             float sp = pow(max(dot(n, H), 0.0), s.glossPow);
-            col += em * (sp * s.glossAmt * 0.06 * atten * range);
+            add += em * (sp * s.glossAmt * 0.08 * atten * range);
         }
+        col += add;
+        float lum = add.x + add.y + add.z;
+        if (lum > bestLum) {
+            bestLum = lum; bestAdd = add; bestL = L; bestDist = sqrt(d2);
+        }
+    }
+
+    // One soft shadow ray toward whichever panel dominates this point.
+    // Ceiling points skip it (a ray grazing the ceiling self-shadows).
+    if (primary && kind != 1 && bestLum > 0.003) {
+        float sh = softShadow(p + n * 0.03, bestL, bestDist, cfg);
+        col -= bestAdd * (1.0 - sh) * 0.78;
     }
 
     // Caustic shimmer on submerged floor
@@ -368,9 +443,10 @@ static float3 shade(float3 p, float3 n, float3 rd, float3 w, float t, float glob
     return col;
 }
 
-static float3 applyFog(float3 col, float t, float3 w)
+static float3 applyFog(float3 col, float t, float3 w, float2 q, float time)
 {
     float den = dot(w, float3(kFogDen[0], kFogDen[1], kFogDen[2]));
+    den *= 0.72 + 0.55 * fbm(q * 0.09 + time * 0.02);   // patchy, slowly drifting haze
     float3 fog = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
     return mix(col, fog, 1.0 - exp(-t * den));
 }
@@ -414,6 +490,7 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
     cfg.doorR = dot(w, float3(0.03, 0.06, 0.80));
     cfg.pillarR = dot(w, float3(0.16, 0.45, 0.40));
     cfg.roundness = w.z;
+    cfg.skirt = 0.016 * w.x;
     cfg.seed = as_type<uint>(U.fwdSeed.w);
 
     bool hit;
@@ -422,7 +499,8 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
     if (hit) {
         float3 p = ro + rd * tHit;
         float3 n = calcNormal(p, cfg);
-        col = applyFog(shade(p, n, rd, w, t, globalLight, waterY, cfg), tHit, w);
+        float2 fq = (ro + rd * min(tHit, 14.0)).xz;
+        col = applyFog(shade(p, n, rd, w, t, globalLight, waterY, true, cfg), tHit, w, fq, t);
     } else {
         col = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
     }
@@ -436,6 +514,22 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
             float e = 0.09;
             float2 grad = float2(fbm(q + float2(e, 0)) - fbm(q - float2(e, 0)),
                                  fbm(q + float2(0, e)) - fbm(q - float2(0, e)));
+
+            // Drips: expanding rings from hashed points, fading as they spread
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dx = -1; dx <= 1; ++dx) {
+                float2 dc = floor(wp.xz / 2.6) + float2(dx, dz);
+                float h1 = vhash(dc * 1.71 + 0.31);
+                float h2 = vhash(dc * 2.13 + 9.17);
+                float2 cpos = (dc + float2(0.2 + 0.6 * h1, 0.2 + 0.6 * h2)) * 2.6;
+                float ph = fract(t / (4.0 + 5.0 * h1) + h2 * 7.0);
+                float r = length(wp.xz - cpos);
+                float ring = sin((r - ph * 2.1) * 30.0)
+                           * exp(-fabs(r - ph * 2.1) * 6.0)
+                           * exp(-ph * 3.5) * 0.35;
+                if (r > 1e-3) grad += (wp.xz - cpos) / r * ring;
+            }
+
             float3 nW = normalize(float3(-grad.x * 0.22, 1.0, -grad.y * 0.22));
 
             float3 rrd = reflect(rd, nW);
@@ -446,8 +540,8 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
             if (rhit) {
                 float3 rp = wp + normalize(rrd) * rt;
                 float3 rn = calcNormal(rp, cfg);
-                rcol = applyFog(shade(rp, rn, normalize(rrd), w, t, globalLight, waterY, cfg),
-                                tw + rt, w);
+                rcol = applyFog(shade(rp, rn, normalize(rrd), w, t, globalLight, waterY, false, cfg),
+                                tw + rt, w, wp.xz, t);
             } else {
                 rcol = w.x * kFogCol[0] + w.y * kFogCol[1] + w.z * kFogCol[2];
             }
@@ -509,6 +603,33 @@ fragment float4 blur_fs(FSOut in [[stage_in]],
         c += src.sample(linearSampler, in.uv - dir * offsets[i]).rgb * weights[i];
     }
     return float4(c, 1.0);
+}
+
+// Catmull-Rom upsample (9 bilinear taps): keeps the half-res raymarch crisp.
+static float3 sampleCatmullRom(texture2d<float> tex, float2 uv, float2 texSize)
+{
+    float2 samplePos = uv * texSize;
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - texPos1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 tp0 = (texPos1 - 1.0) / texSize;
+    float2 tp3 = (texPos1 + 2.0) / texSize;
+    float2 tp12 = (texPos1 + w2 / w12) / texSize;
+    float3 c =
+        tex.sample(linearSampler, float2(tp0.x, tp0.y)).rgb * w0.x * w0.y +
+        tex.sample(linearSampler, float2(tp12.x, tp0.y)).rgb * w12.x * w0.y +
+        tex.sample(linearSampler, float2(tp3.x, tp0.y)).rgb * w3.x * w0.y +
+        tex.sample(linearSampler, float2(tp0.x, tp12.y)).rgb * w0.x * w12.y +
+        tex.sample(linearSampler, float2(tp12.x, tp12.y)).rgb * w12.x * w12.y +
+        tex.sample(linearSampler, float2(tp3.x, tp12.y)).rgb * w3.x * w12.y +
+        tex.sample(linearSampler, float2(tp0.x, tp3.y)).rgb * w0.x * w3.y +
+        tex.sample(linearSampler, float2(tp12.x, tp3.y)).rgb * w12.x * w3.y +
+        tex.sample(linearSampler, float2(tp3.x, tp3.y)).rgb * w3.x * w3.y;
+    return max(c, 0.0);
 }
 
 static float3 acesFilm(float3 x)
@@ -588,7 +709,7 @@ fragment float4 composite_fs(FSOut in [[stage_in]],
         uv.x = fract(uv.x + off);
     }
 
-    float3 c = hdr.sample(linearSampler, uv).rgb;
+    float3 c = sampleCatmullRom(hdr, uv, P.res.zw);
     float3 b = bloomNear.sample(linearSampler, uv).rgb * 0.62
              + bloomFar.sample(linearSampler, uv).rgb * 0.38;
     c += b * P.params.w;

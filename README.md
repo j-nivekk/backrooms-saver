@@ -4,7 +4,9 @@ A liminal-space macOS screen saver: an endless, procedurally generated interior
 toured by a camera that alternates between slow cinematic drifts and locked-off
 CCTV angles (timestamp, CAM ##, blinking REC, glitch on the cuts).
 
-The world drifts between three moods on a slow timeline (~8 minutes per lap):
+The world drifts between three moods on a randomised schedule: every launch
+starts in a random mood, holds it for a random 1.5–2.5 minutes, then melts into
+a randomly chosen next one — no fixed order:
 
 | Phase | Look |
 | --- | --- |
@@ -80,5 +82,5 @@ modes. arm64, macOS 13+.
 - Maze density: the region probabilities in `wallSDF` — and their **mirror** in
   `Director.swift` (`regionDense` / `wallExists` / `doorExists`), which must
   stay bit-identical or the camera will walk through walls.
-- Shot pacing and level timeline: `startDrift` / `startCCTV` durations and
-  `levelWeights` in `Director.swift`.
+- Shot pacing and the level schedule: `startDrift` / `startCCTV` durations and
+  `updateLevels` / `holdDuration` in `Director.swift`.
