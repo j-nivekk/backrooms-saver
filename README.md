@@ -42,14 +42,25 @@ cuts to black, and you are somewhere else entirely.
 
 About a third of the time it does not go to a real level. It goes to a **fever**
 level: a real one wearing other levels' surfaces, with the lighting gone wrong.
-Carpet under poolroom tile walls. An office lit blood red. The Lobby flooded to
-the ankles and nearly pitch dark.
 
 ![Fever levels](docs/media/fever.jpg)
+
+Floor, walls and ceiling each draw from *any* level independently, so the Lobby
+can grow a poolroom tile floor or Motion Lights can be papered in Hotel crimson.
+On top of that the light gets scaled and tinted, fog thickens or thins, the
+ceiling rises or drops, and water can appear on any level rather than only in
+the Poolrooms.
 
 The best case is a fever of the level you are *already in*, because then it
 melts rather than cuts — and the room you are standing in slowly goes wrong
 around you, the lights sinking and the water coming up, without a single edit.
+
+Every fever is reproducible: `--fever` is deterministic on the seed, and prints
+what it made, so you can hunt for one and get back to it.
+
+```bash
+./build/backdev window --fever --seed 11   # the green one, second above
+```
 
 ### Level 94 has a resident
 
