@@ -72,7 +72,11 @@ func makeRenderer() -> BackroomsRenderer {
                                       preview: preview, seed: seed,
                                       wallTextureURL: findTexture("walltex"),
                                       woodTextureURL: findTexture("woodtex"))
-        if args.contains("--fever") { r.director.pinFever() }
+        if args.contains("--fever") {
+            let k = r.director.pinFever()
+            FileHandle.standardError.write("fever (seed \(seed)): \(k.describe)\n"
+                                            .data(using: .utf8)!)
+        }
         else if let lv = forcedLevel { r.director.pin(level: lv) }
         r.director.forcedShot = forcedShot
         if let h = horrorFlag { r.director.horror = h }
@@ -163,20 +167,6 @@ func runWindow() {
 func printTimeline(minutes: Float) {
     let d = Director(seed: seed, preview: preview)
     if let h = horrorFlag { d.horror = h }
-    let names = ["Lobby", "Habitable", "Poolrooms", "Office", "Hotel", "MotionLights"]
-    func describe(_ k: Look) -> String {
-        if !k.isFever { return names[k.base] }
-        var parts = ["FEVER \(names[k.base])"]
-        var worn: [String] = []
-        if k.floorSrc != k.base { worn.append("floor:\(names[k.floorSrc])") }
-        if k.wallSrc != k.base { worn.append("walls:\(names[k.wallSrc])") }
-        if k.ceilSrc != k.base { worn.append("ceil:\(names[k.ceilSrc])") }
-        if !worn.isEmpty { parts.append("(" + worn.joined(separator: " ") + ")") }
-        if k.lightScale < 0.5 { parts.append("dim") }
-        if k.lightScale > 2.0 { parts.append("blinding") }
-        if k.waterY > 0 { parts.append("flooded") }
-        return parts.joined(separator: " ")
-    }
     let step: Float = 1.0 / 30.0
     var t: Float = 0
     var prev: Look?
@@ -197,7 +187,7 @@ func printTimeline(minutes: Float) {
                 if peak > 0.01 { melts += 1 } else { noclips += 1 }
                 if cur.isFever { fevers += 1 }
                 print(String(format: "%6.1fs  %@  %@ -> %@ (%.0fs)",
-                             t, kind, describe(pv), describe(cur), t - start))
+                             t, kind, pv.describe, cur.describe, t - start))
             }
             prev = cur; start = t; peak = 0
         }

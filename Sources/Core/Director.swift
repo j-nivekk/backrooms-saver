@@ -44,6 +44,28 @@ public struct Look {
     public var waterY: Float = -0.30
     public var isFever = false
 
+    static let names = ["Lobby", "Habitable", "Poolrooms", "Office", "Hotel", "MotionLights"]
+
+    /// Human-readable summary - what this level is and what it is wearing.
+    public var describe: String {
+        if !isFever { return Look.names[base] }
+        var parts = ["FEVER \(Look.names[base])"]
+        var worn: [String] = []
+        if floorSrc != base { worn.append("floor:\(Look.names[floorSrc])") }
+        if wallSrc != base { worn.append("walls:\(Look.names[wallSrc])") }
+        if ceilSrc != base { worn.append("ceil:\(Look.names[ceilSrc])") }
+        if !worn.isEmpty { parts.append("(" + worn.joined(separator: " ") + ")") }
+        if lightScale < 0.5 { parts.append(String(format: "dim x%.2f", lightScale)) }
+        if lightScale > 2.0 { parts.append(String(format: "blinding x%.1f", lightScale)) }
+        if lightTint.x > 1.5 * lightTint.z { parts.append("red") }
+        if lightTint.y > 1.5 * lightTint.x { parts.append("green") }
+        if lightTint.z > 1.5 * lightTint.x { parts.append("cold") }
+        if waterY > 0 { parts.append(String(format: "flooded %.2fm", waterY)) }
+        if ceilScale < 0.9 { parts.append("low ceiling") }
+        if ceilScale > 1.15 { parts.append("high ceiling") }
+        return parts.joined(separator: " ")
+    }
+
     static func canon(_ level: Int) -> Look {
         var k = Look()
         k.base = level
@@ -133,7 +155,12 @@ public final class Director {
     /// Debug: pin one look for the whole run (backdev --level / --fever).
     private var forcedLook: Look?
     public func pin(level: Int) { forcedLook = Look.canon(min(max(level, 0), kLevelCount - 1)) }
-    public func pinFever() { forcedLook = feverLook() }
+    @discardableResult
+    public func pinFever() -> Look {
+        let k = feverLook()
+        forcedLook = k
+        return k
+    }
     /// Defaults to the kHorror dial; backdev's --horror overrides it per run.
     public var horror: Float = kHorror
     /// Debug only: pin an entity on screen (0 smiler, 1 figure) for tuning.
