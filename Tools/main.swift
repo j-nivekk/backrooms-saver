@@ -72,7 +72,8 @@ func makeRenderer() -> BackroomsRenderer {
                                       preview: preview, seed: seed,
                                       wallTextureURL: findTexture("walltex"),
                                       woodTextureURL: findTexture("woodtex"))
-        r.director.forcedLevel = forcedLevel
+        if args.contains("--fever") { r.director.pinFever() }
+        else if let lv = forcedLevel { r.director.pin(level: lv) }
         r.director.forcedShot = forcedShot
         if let h = horrorFlag { r.director.horror = h }
         r.director.forcedEntity = Int(flag("--entity", default: ""))
@@ -163,31 +164,47 @@ func printTimeline(minutes: Float) {
     let d = Director(seed: seed, preview: preview)
     if let h = horrorFlag { d.horror = h }
     let names = ["Lobby", "Habitable", "Poolrooms", "Office", "Hotel", "MotionLights"]
+    func describe(_ k: Look) -> String {
+        if !k.isFever { return names[k.base] }
+        var parts = ["FEVER \(names[k.base])"]
+        var worn: [String] = []
+        if k.floorSrc != k.base { worn.append("floor:\(names[k.floorSrc])") }
+        if k.wallSrc != k.base { worn.append("walls:\(names[k.wallSrc])") }
+        if k.ceilSrc != k.base { worn.append("ceil:\(names[k.ceilSrc])") }
+        if !worn.isEmpty { parts.append("(" + worn.joined(separator: " ") + ")") }
+        if k.lightScale < 0.5 { parts.append("dim") }
+        if k.lightScale > 2.0 { parts.append("blinding") }
+        if k.waterY > 0 { parts.append("flooded") }
+        return parts.joined(separator: " ")
+    }
     let step: Float = 1.0 / 30.0
     var t: Float = 0
-    var prevA = -1
+    var prev: Look?
     var start: Float = 0
     var peak: Float = 0
-    var from = -1
-    var melts = 0, noclips = 0
+    var melts = 0, noclips = 0, fevers = 0
     while t < minutes * 60 {
         d.update(deltaTime: step)
         let f = d.frame()
-        if f.levelA != prevA {
-            if prevA >= 0 {
-                // A melt is the one that actually ramps the blend; a noclip
-                // swaps behind a blackout with blend pinned at zero.
+        let cur = f.lookA
+        let changed = prev.map { $0.base != cur.base || $0.isFever != cur.isFever
+                                 || $0.floorSrc != cur.floorSrc || $0.wallSrc != cur.wallSrc
+                                 || $0.ceilSrc != cur.ceilSrc } ?? true
+        if changed {
+            if let pv = prev {
+                // A melt ramps the blend; a noclip swaps behind a blackout at 0.
                 let kind = peak > 0.01 ? "melt  " : "NOCLIP"
                 if peak > 0.01 { melts += 1 } else { noclips += 1 }
-                print(String(format: "%6.1fs  %@  %-13@ -> %-13@ (%.1fs)",
-                             t, kind, names[from], names[f.levelA], t - start))
+                if cur.isFever { fevers += 1 }
+                print(String(format: "%6.1fs  %@  %@ -> %@ (%.0fs)",
+                             t, kind, describe(pv), describe(cur), t - start))
             }
-            prevA = f.levelA; from = f.levelA; start = t; peak = 0
+            prev = cur; start = t; peak = 0
         }
         peak = max(peak, f.blend)
         t += step
     }
-    print("\n  \(melts) melts, \(noclips) noclips")
+    print("\n  \(melts) melts, \(noclips) noclips, \(fevers) fever levels")
 }
 
 switch mode {
@@ -202,7 +219,7 @@ case "window":
 default:
     print("""
     usage: backdev [window|render <out.png>] [--seed N] [--at seconds]
-                   [--level 0..5] [--shot drift|cctv] [--horror 0..1]
+                   [--level 0..5 | --fever] [--shot drift|cctv] [--horror 0..1]
                    [--width N] [--height N] [--dump f1,f2] [--preview]
 
     levels: 0 Lobby  1 Habitable  2 Poolrooms  3 Office  4 Hotel  5 MotionLights

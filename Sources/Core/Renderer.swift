@@ -16,9 +16,23 @@ struct GPUUniforms {
     var level: SIMD4<Float>
     var mode: SIMD4<Float>
     var horror: SIMD4<Float>
+    var lookA0: SIMD4<Float>
+    var lookA1: SIMD4<Float>
+    var lookA2: SIMD4<Float>
+    var lookB0: SIMD4<Float>
+    var lookB1: SIMD4<Float>
+    var lookB2: SIMD4<Float>
     var motion: SIMD4<Float>
     var entPos: SIMD4<Float>
     var entCfg: SIMD4<Float>
+}
+
+/// A Look packs into three float4s so Swift and MSL agree on offsets without
+/// any packing guesswork, same rule as the rest of the uniform block.
+private func packLook(_ k: Look) -> (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) {
+    (SIMD4(Float(k.base), Float(k.floorSrc), Float(k.wallSrc), Float(k.ceilSrc)),
+     SIMD4(k.lightScale, k.lightTint.x, k.lightTint.y, k.lightTint.z),
+     SIMD4(k.fogScale, k.pillarScale, 0, 0))
 }
 
 struct GPUComposite {
@@ -216,15 +230,18 @@ public final class BackroomsRenderer {
         frameIndex = (frameIndex + 1) % Self.maxFramesInFlight
 
         let f = director.frame()
+        let la = packLook(f.lookA), lb = packLook(f.lookB)
         let tanY = f.tanX * Float(internalSize.y) / Float(internalSize.x)
         var uniforms = GPUUniforms(
             eyeTime: SIMD4(f.eye.x, f.eye.y, f.eye.z, time),
             rightTanX: SIMD4(f.right.x, f.right.y, f.right.z, f.tanX),
             upTanY: SIMD4(f.up.x, f.up.y, f.up.z, tanY),
             fwdSeed: SIMD4(f.fwd.x, f.fwd.y, f.fwd.z, Float(bitPattern: director.seed)),
-            level: SIMD4(Float(f.levelA), Float(f.levelB), f.blend, f.waterY),
+            level: SIMD4(f.blend, f.waterY, 0, 0),
             mode: SIMD4(f.cctv, f.globalLight, f.ceilH, hasWallTexture ? 1 : 0),
             horror: SIMD4(f.horror, hasWoodTexture ? 1 : 0, 0, 0),
+            lookA0: la.0, lookA1: la.1, lookA2: la.2,
+            lookB0: lb.0, lookB1: lb.1, lookB2: lb.2,
             motion: SIMD4(f.motionCentre.x, f.motionCentre.y, f.motionFwd.x, f.motionFwd.y),
             entPos: SIMD4(f.entity.x, f.entity.y, f.entity.z, f.entityAlpha),
             entCfg: SIMD4(f.entityType, f.entityScale, f.entityPhase, 0))

@@ -11,6 +11,10 @@ rooms whose walls and doorways are decided by hashing the cell coordinates, so
 the world is unbounded, deterministic and never stored — it is regenerated from
 its coordinates every frame. Walk for an hour and you will not repeat a room.
 
+Every archway, column and doorway is drawn from the same hashes: widths, crown
+heights, how round or shallow an arch springs, whether it leans, whether a
+column tapers or flares or has simply given up and tilted.
+
 ## Six levels
 
 Every launch starts somewhere random, holds it a couple of minutes, then moves
@@ -32,6 +36,19 @@ Getting between them depends on how far apart they are. Levels that share a
 palette **melt** into each other over half a minute — that is how the poolroom
 water rises out of the floor. Everything else **noclips**: the picture tears,
 cuts to black, and you are somewhere else entirely.
+
+## Fever levels
+
+About a third of the time it does not go to a real level. It goes to a **fever**
+level: a real one wearing other levels' surfaces, with the lighting gone wrong.
+Carpet under poolroom tile walls. An office lit blood red. The Lobby flooded to
+the ankles and nearly pitch dark.
+
+![Fever levels](docs/media/fever.jpg)
+
+The best case is a fever of the level you are *already in*, because then it
+melts rather than cuts — and the room you are standing in slowly goes wrong
+around you, the lights sinking and the water coming up, without a single edit.
 
 ### Level 94 has a resident
 

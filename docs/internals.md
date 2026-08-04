@@ -18,6 +18,7 @@ display, so the look can be tuned over SSH or in an agent session.
 | --- | --- |
 | `--at N` | Pre-roll the director N seconds before frame 1 |
 | `--level 0..5` | Pin a level (0 Lobby, 1 Habitable, 2 Poolrooms, 3 Office, 4 Hotel, 5 MotionLights) |
+| `--fever` | Pin a randomly generated fever level instead |
 | `--shot drift\|cctv` | Pin a shot type |
 | `--seed N` | Pick a different maze |
 | `--horror 0..1` | Override the horror dial for one run |
@@ -92,6 +93,25 @@ To add a level: append a row to `kLevels[]` in `Backrooms.metal`, bump
 in `Director.swift` (the camera needs the heights CPU-side), and decide its melt
 pairs in `kMeltPairs`.
 
+### Fever levels
+
+A `Look` is what actually reaches the shader: a base level (geometry knobs,
+panels, fog) plus *independent* material sources for floor, wall and ceiling,
+plus scalars for light, fog, pillars, ceiling height and water. A canon level is
+the identity case — every source equals the base, every scale is 1 — so it costs
+exactly what it did before fever levels existed. `feverLook()` in
+`Director.swift` is the whole generator.
+
+### Props
+
+There is a `propProb` column in `kLevels[]`, set to 0 on every level. It puts
+stacked crates in the rooms and it works, but it is off for two reasons: it cost
+about 15% of frame time, and crates band at close range because the AO and
+soft-shadow rays sample further than a crate is thick. Desks and chairs were
+built first and were worse for the same reason — a 3 cm chair back is far
+thinner than the sampling radius. Scattered clothing survived instead, as pure
+floor albedo, which costs nothing in the march.
+
 ## Rendering
 
 Lighting is a 3×3 neighbourhood of emissive ceiling panels — some flickering,
@@ -155,6 +175,13 @@ Two traps worth knowing:
 - A `smoothstep` with **variable** edges hides a divide. `wallSDF` runs on the
   order of 500 times per pixel, so one of those in there is measurable — see
   `cfg.wainscotInv`, which folds the reciprocal out.
+- Any early-out in `map()` must be a *bound*, never a cutoff. Two bugs here came
+  from forgetting that: an arch slab thicker than what `dQuick` bounds turned
+  that early-out into an over-estimate and speckled the frame with tunnelling,
+  and a "skip props above eye height" test let rays step straight into a crate.
+  Swapping a cheap bound for the exact shape part way is also unsafe for a
+  different reason: `calcAO` and `softShadow` sample out to ~1.1 m, so they
+  straddle the jump and paint false occlusion bands.
 - When benchmarking, **interleave the A and B runs and pin `--level`**. Running
   all of A then all of B lets thermal drift masquerade as a regression, and
   unforced runs may compare different levels entirely if the two builds draw

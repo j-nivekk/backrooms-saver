@@ -11,9 +11,16 @@ struct RMUniforms {
     float4 rightTanX;   // xyz right basis, w tan(fovX/2)
     float4 upTanY;      // xyz up basis, w tan(fovY/2)
     float4 fwdSeed;     // xyz forward basis, w world seed (as bits)
-    float4 level;       // x level A, y level B, z blend A->B, w water height
+    float4 level;       // x blend A->B, y water height, zw unused
     float4 mode;        // x cctv, y global light, z ceiling height, w wall texture present
     float4 horror;      // x horror amount, y wood texture present, zw unused
+    // Two "looks", one per live level. A look is a base level plus per-surface
+    // material sources and a few scalar overrides, which is what lets the
+    // Director synthesise fever variants that mix elements between levels.
+    float4 lookA0;      // x base, y floorSrc, z wallSrc, w ceilSrc (level ids)
+    float4 lookA1;      // x light scale, yzw light tint
+    float4 lookA2;      // x fog scale, y pillar scale, zw unused
+    float4 lookB0, lookB1, lookB2;
     float4 motion;      // xy motion-light centre (xz), zw its forward (xz)
     float4 entPos;      // xyz entity world position, w alpha (0 = none)
     float4 entCfg;      // x type (0 smiler, 1 figure), y card scale, z phase, w unused
@@ -58,6 +65,8 @@ constant uint kSaltDoorSz  = 0x9B05688Cu;
 constant uint kSaltPilSize = 0x27B70A85u;
 constant uint kSaltPilShape = 0x2E1B2138u;
 constant uint kSaltMotion   = 0x6A09E667u;   // GPU-only: motion-light radius jitter
+constant uint kSaltProp     = 0xBB67AE85u;   // GPU-only: which corner owns a prop
+constant uint kSaltCloth    = 0x3C6EF372u;   // GPU-only: floor clutter decals
 
 static uint uhash(uint h)
 {
@@ -121,8 +130,58 @@ struct MapCfg {
     // which the old fixed 0.13/0.05 edges folded away. Cheap to keep folded.
     float wainscotInv;
     float leanAmt, partProb, soffitProb;
+    float pillarProb, archProb, bowAmt, propProb;
     uint seed;
 };
+
+static float boxSDF(float3 p, float3 b)
+{
+    float3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+// Props are all UNDER 0.95 m. That single rule is what makes them safe: the
+// camera eye rides at 1.55 m, so it passes over anything it walks through and
+// can never clip one. Tall furniture (shelves, coat racks) would need to be
+// pinned to doorless walls the planner never crosses, so it is left out.
+constant float kPropTop = 0.95;
+
+// Crates only, and deliberately so. Desks and chairs were built here too, but
+// their thin parts - a 7 cm table top, a 3 cm chair back - are thinner than the
+// AO and soft-shadow sampling radius, so they came out banded and melted at
+// close range. Chunky boxes have no feature small enough to hit that, and a
+// stack of abandoned crates is the more backrooms prop regardless.
+static float propSDF(float3 p, float h)
+{
+    float k = fract(h * 91.7);
+    float w = 0.24 + 0.07 * fract(h * 53.1);
+    float d = boxSDF(p - float3(0.0, w, 0.0), float3(w * 1.15, w, w * 1.05));
+    if (k < 0.55) {          // a second crate shoved on top, off-centre
+        float w2 = w * 0.78;
+        d = min(d, boxSDF(p - float3(w * 0.35, w * 2.0 + w2, w * 0.2),
+                          float3(w2 * 1.1, w2, w2)));
+    }
+    return d;
+}
+
+/// Where the prop owned by `corner` sits, in that corner's local frame, and how
+/// far `p` is from it. Returns a cheap AABB bound first so the march only pays
+/// for the real shape when it is close. `q` is p.xz relative to the corner.
+static float propAt(float2 q, float3 p, int2 corner, MapCfg cfg, thread float &hOut)
+{
+    float hp = hcell(corner, kSaltProp, cfg.seed);
+    hOut = hp;
+    if (hp >= cfg.propProb) return 1e5;
+    float2 sgn = float2(fract(hp * 13.1) < 0.5 ? -1.0 : 1.0,
+                        fract(hp * 17.9) < 0.5 ? -1.0 : 1.0);
+    float2 off = float2(0.75 + 0.75 * fract(hp * 31.7), 0.75 + 0.75 * fract(hp * 71.3));
+    float3 lp = float3(q.x - off.x * sgn.x, p.y, q.y - off.y * sgn.y);
+    // No AABB shortcut here. Swapping a cheap bound for the exact shape part way
+    // makes the field jump, and calcAO/softShadow sample out to ~1.1 m - they
+    // straddle that jump and band the prop with false occlusion. The exact
+    // union is only a couple of boxes, so just pay for it.
+    return propSDF(lp, hp);
+}
 
 // Geometry variety lives here, but NOTHING may change passability: the Swift
 // path planner only knows "wall yes/no" and "door yes/no". So partitions only
@@ -141,15 +200,45 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
     float aBox = abs(aL - kCell * 0.5) - kCell * 0.5;
 
     // Conservative bound over every variant this wall could be (max thickness,
-    // max lean, skirt). Far from the slab, skip all the detail hashes: a lower
-    // bound is a valid sphere-tracing distance.
-    float dQuick = max(abs(perp - lineC) - (kHalfT * 1.8 + cfg.leanAmt + cfg.skirt), aBox);
+    // max lean, bow, skirt). Far from the slab, skip all the detail hashes: a
+    // lower bound is a valid sphere-tracing distance.
+    float dQuick = max(abs(perp - lineC)
+                       - (kHalfT * 1.8 + cfg.leanAmt + cfg.bowAmt + cfg.skirt), aBox);
     if (dQuick > 0.55) return dQuick;
 
     if (edgeHash(e, axis, kSaltWall, cfg.seed) >= wallProb) {
-        // Open edge - sometimes a soffit beam hangs across it.
+        // Open edge. It may carry an archway, or a soffit beam, or nothing.
+        // One hash decides which, split into ranges, so this costs no extra
+        // lookup in the march loop.
         float sh = edgeHash(e, axis, kSaltSoffit, cfg.seed);
-        if (sh >= cfg.soffitProb) return 1e5;
+        if (sh < cfg.archProb) {
+            // Archway: a slab with a wide opening centred on the edge - which is
+            // exactly where the planner crosses an open edge, so the crossing
+            // keeps well over half a metre of clearance either side.
+            //
+            // Every dimension is drawn off the same edge hash. The hash already
+            // varies per edge; what made early arches look stamped from one mould
+            // was that only the *presence* was hashed and the shape was constant.
+            float a1 = fract(sh * 61.7), a2 = fract(sh * 131.3), a3 = fract(sh * 277.1);
+            // 1.8 is the ceiling here, not a taste choice: dQuick above bounds
+            // wall thickness at kHalfT * 1.8, and anything thicker turns that
+            // early-out into an OVER-estimate, which lets rays tunnel through
+            // and speckles the whole frame.
+            float d = max(abs(perp - lineC) - kHalfT * mix(1.2, 1.8, a1), aBox);
+            float aw = mix(2.55, 3.45, a1);                       // springing width
+            float ah = max(cfg.ceilH - mix(0.22, 0.95, a2), 2.4);  // crown height
+            // r sweeps a shallow segmental head through to a full semicircle
+            float r = min(aw * 0.5, ah * 0.45) * mix(0.32, 1.0, a3);
+            // Lean the head over. The shear is zero at the floor, so the point
+            // where the camera actually crosses is untouched and this is free.
+            float tilt = (a2 - 0.5) * 0.6;
+            float xr = aL - kCell * 0.5 - tilt * clamp(p.y / max(ah, 0.1), 0.0, 1.0);
+            float2 q = abs(float2(xr, p.y - ah * 0.5 + 0.2))
+                     - float2(aw * 0.5, ah * 0.5 + 0.2) + r;
+            float hole = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+            return max(d, -hole);
+        }
+        if (sh >= cfg.archProb + cfg.soffitProb) return 1e5;
         float yBot = max(cfg.ceilH - mix(0.5, 0.85, fract(sh * 9.3)), 2.3);
         float d = max(abs(perp - lineC) - kHalfT * 1.4, aBox);
         return max(d, yBot - p.y);
@@ -166,7 +255,11 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
     }
     float lh = edgeHash(e, axis, kSaltLean, cfg.seed);
     float lean = (lh < 0.25) ? (lh / 0.125 - 1.0) * cfg.leanAmt : 0.0;
-    float d = max(abs(perp - lineC - lean * (p.y / cfg.ceilH)) - halfT, aBox);
+    // A gentle bow across the span, pinned to zero at both ends so the wall
+    // still meets its corners on the grid line. Peak sits mid-span, where the
+    // doorway usually is, so it stays well inside the planner's door margin.
+    float bow = cfg.bowAmt * (lh * 2.0 - 1.0) * sin(aL * (3.14159265 / kCell));
+    float d = max(abs(perp - lineC - lean * (p.y / cfg.ceilH) - bow) - halfT, aBox);
 
     if (edgeHash(e, axis, kSaltDoor, cfg.seed) < doorProb) {
         float frac = mix(0.28, 0.72, edgeHash(e, axis, kSaltDoorPos, cfg.seed));
@@ -203,20 +296,44 @@ static float map(float3 p, MapCfg cfg)
 
     for (int k = 0; k < 4; ++k) {
         int2 corner = ci + int2(k & 1, k >> 1);
-        float2 q = p.xz - float2(corner) * kCell;
+        float2 q0 = p.xz - float2(corner) * kCell;
+        float2 q = q0;
         float dSq = max(abs(q.x), abs(q.y));
-        if (dSq - 0.62 > 0.4) { d = min(d, dSq - 0.62); continue; }
+        // 0.80 bounds the fattest column plus its flare and its lean.
+        if (dSq - 0.80 > 0.4) { d = min(d, dSq - 0.80); continue; }
         float ph = hcell(corner, kSaltPillar, cfg.seed);
         // The 0.10 minimum is load-bearing: corner plugs are the conservative
         // bound that stops rays tunnelling past co-linear neighbour walls.
         float r = 0.10;
         float round = cfg.roundness;
-        if (ph < 0.30) {
+        if (ph < cfg.pillarProb) {
             float sh = hcell(corner, kSaltPilSize, cfg.seed);
             r = clamp(cfg.pillarR * (0.45 + 1.35 * sh), 0.10, 0.60);
-            if (hcell(corner, kSaltPilShape, cfg.seed) < 0.35) round = 1.0;
+            float shp = hcell(corner, kSaltPilShape, cfg.seed);
+            if (shp < 0.35) round = 1.0;
+            // Column character: entasis toward the ceiling, a flared base and
+            // capital, and occasionally one that has given up and leans.
+            float hN = clamp(p.y / cfg.ceilH, 0.0, 1.0);
+            r *= 1.0 - 0.20 * hN;
+            r += r * 0.20 * (smoothstep(0.11, 0.0, hN) + smoothstep(0.86, 1.0, hN));
+            if (shp > 0.82) q -= (0.14 * (hN - 0.5)) * float2(1.0, 0.65);
+            dSq = max(abs(q.x), abs(q.y));
         }
         d = min(d, mix(dSq, length(q), round) - r);
+
+        // Props hang off the same corners, so the existing 4-corner loop
+        // already covers every prop within reach - no extra neighbourhood.
+        // Note q0, not q: the pillar lean above shears q with height, and
+        // feeding that to a prop would twist it into a corkscrew.
+        //
+        // There is deliberately no "skip if p.y is above the props" test here.
+        // That is a cutoff rather than a bound: a ray coming down from eye
+        // height would see no prop at all, take one huge step and land inside
+        // one. propAt's AABB is conservative in y, so it does the job honestly.
+        if (cfg.propProb > 0.0) {
+            float hp;
+            d = min(d, propAt(q0, p, corner, cfg, hp));
+        }
     }
     return d;
 }
@@ -302,6 +419,14 @@ struct LevelDef {
     float  leanAmt, partProb, soffitProb;
     float  motion;        // 1 = panels ignite by proximity to the eye
     float  darkness;      // 1 = entities read as Smilers, 0 = as figures
+    float  pillarProb;    // how often a corner grows a real column
+    float  archProb;      // how often an open edge becomes an archway
+    float  bowAmt;        // gentle lateral bow across a wall span
+    // Chance a corner owns a crate. OFF (0) on every level by default: the
+    // crates render honestly at a distance but band at close range, because
+    // the AO and soft-shadow rays sample further than the crate is thick, and
+    // they cost ~15% of frame time. Raise per level to switch them back on.
+    float  propProb;
 };
 
 constant LevelDef kLevels[6] = {
@@ -315,7 +440,8 @@ constant LevelDef kLevels[6] = {
         1.50, 2.25, 0.03,
         0.16, 0.00, 0.016, 0.130,
         0.06, 0.30, 0.25,
-        0.0, 0.15
+        0.0, 0.15,
+        0.18, 0.10, 0.05, 0.0
     },
     {   // 1 - Level 1, Habitable Zone
         float3(0.70, 0.95, 0.78) * 9.5, 0.30, float2(0.68, 0.07),
@@ -327,7 +453,8 @@ constant LevelDef kLevels[6] = {
         2.30, 2.60, 0.06,
         0.45, 0.00, 0.000, 0.130,
         0.22, 0.35, 0.30,
-        0.0, 0.55
+        0.0, 0.55,
+        0.34, 0.14, 0.10, 0.0
     },
     {   // 2 - Level 37, Poolrooms
         float3(0.85, 0.93, 1.05) * 8.0, 0.42, float2(0.42, 0.42),
@@ -339,7 +466,8 @@ constant LevelDef kLevels[6] = {
         1.90, 3.10, 0.80,
         0.40, 1.00, 0.000, 0.130,
         0.05, 0.15, 0.15,
-        0.0, 0.10
+        0.0, 0.10,
+        0.22, 0.42, 0.04, 0.0
     },
     {   // 3 - Level 4, Abandoned Office
         float3(0.92, 0.96, 1.00) * 6.0, 0.62, float2(0.60, 0.32),
@@ -351,7 +479,8 @@ constant LevelDef kLevels[6] = {
         1.85, 2.35, 0.02,
         0.20, 0.00, 0.012, 0.100,
         0.04, 0.62, 0.22,
-        0.0, 0.20
+        0.0, 0.20,
+        0.15, 0.06, 0.03, 0.0
     },
     {   // 4 - Level 5, Terror Hotel
         float3(1.00, 0.84, 0.58) * 6.5, 0.34, float2(0.16, 0.16),
@@ -363,7 +492,8 @@ constant LevelDef kLevels[6] = {
         1.35, 2.15, 0.35,
         0.18, 0.35, 0.020, 0.950,
         0.03, 0.20, 0.18,
-        0.0, 0.45
+        0.0, 0.45,
+        0.20, 0.34, 0.06, 0.0
     },
     {   // 5 - Level 94, Motion Lights
         float3(0.88, 0.94, 1.00) * 11.0, 0.70, float2(0.55, 0.30),
@@ -375,7 +505,8 @@ constant LevelDef kLevels[6] = {
         2.10, 2.50, 0.04,
         0.30, 0.00, 0.000, 0.130,
         0.10, 0.25, 0.28,
-        1.0, 1.00
+        1.0, 1.00,
+        0.30, 0.12, 0.08, 0.0
     },
 };
 
@@ -384,8 +515,38 @@ constant LevelDef kLevels[6] = {
 // two LevelDefs by value would be ~240 bytes of struct copied down the whole
 // call graph. The level pair is uniform across the draw, so reading kLevels[]
 // from the constant address space is a scalar load instead.
+// A look is "which level am I, and which bits of other levels am I wearing".
+// For a canon level every source equals `base` and every scale is 1, so the
+// canon path costs exactly what it did before fever levels existed.
+struct Look {
+    int base;                          // geometry knobs, panels, fog come from here
+    int floorSrc, wallSrc, ceilSrc;    // materials may come from anywhere
+    float lightScale, fogScale, pillarScale;
+    float3 lightTint;
+};
+
+static Look unpackLook(float4 a, float4 b, float4 c)
+{
+    Look L;
+    L.base     = clamp(int(a.x), 0, 5);
+    L.floorSrc = clamp(int(a.y), 0, 5);
+    L.wallSrc  = clamp(int(a.z), 0, 5);
+    L.ceilSrc  = clamp(int(a.w), 0, 5);
+    L.lightScale = b.x;
+    L.lightTint  = b.yzw;
+    L.fogScale   = c.x;
+    L.pillarScale = c.y;
+    return L;
+}
+
+/// The material source for one surface kind: 0 floor, 1 ceiling, 2 wall.
+static int srcFor(thread const Look &k, int kind)
+{
+    return (kind == 0) ? k.floorSrc : ((kind == 1) ? k.ceilSrc : k.wallSrc);
+}
+
 struct LevelMix {
-    int ia, ib;           // indices into kLevels
+    Look a, b;
     float t;              // 0 = pure a, 1 = pure b
     float horror;
 };
@@ -548,6 +709,27 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
         a = base * (0.9 + 0.2 * vnoise(float2(along * 30.0, p.y * 60.0)));
     }
 
+    if (kind == 0) {
+        // Scattered clothing and debris. Pure albedo - no geometry, so this is
+        // free in the march and costs one test per shaded floor pixel.
+        float2 cc = floor(p.xz / 2.0);
+        float ch = vhash(cc + 0.5);
+        if (ch < 0.20) {
+            float2 cpos = (cc + float2(0.25 + 0.5 * fract(ch * 37.0),
+                                       0.25 + 0.5 * fract(ch * 71.0))) * 2.0;
+            float2 dv = p.xz - cpos;
+            float ang = ch * 6.2831;
+            float ca = cos(ang), sa = sin(ang);
+            float2 rv = float2(dv.x * ca - dv.y * sa, dv.x * sa + dv.y * ca);
+            float m = smoothstep(0.30, 0.13, length(rv * float2(1.0, 2.3)))
+                    * (0.55 + 0.45 * fbm(p.xz * 9.0));
+            float3 cloth = float3(0.20 + 0.30 * fract(ch * 13.0),
+                                  0.19 + 0.22 * fract(ch * 29.0),
+                                  0.22 + 0.26 * fract(ch * 53.0));
+            a = mix(a, cloth, clamp(m, 0.0, 1.0) * 0.85);
+        }
+    }
+
     s.albedo = a;
     return s;
 }
@@ -558,9 +740,11 @@ static Surface surfaceAt(float3 p, float3 n, int kind, thread const LevelMix &L,
                          texture2d<float> woodTex, float hasWood, MapCfg cfg)
 {
     float along = (abs(n.x) > 0.5) ? p.z : p.x;
-    Surface s = materialFor(L.ia, kind, p, n, along, waterY, wallTex, hasTex, woodTex, hasWood, cfg);
+    Surface s = materialFor(srcFor(L.a, kind), kind, p, n, along, waterY,
+                           wallTex, hasTex, woodTex, hasWood, cfg);
     if (L.t > 0.004) {
-        Surface o = materialFor(L.ib, kind, p, n, along, waterY, wallTex, hasTex, woodTex, hasWood, cfg);
+        Surface o = materialFor(srcFor(L.b, kind), kind, p, n, along, waterY,
+                               wallTex, hasTex, woodTex, hasWood, cfg);
         s.albedo = mix(s.albedo, o.albedo, L.t);
         s.glossAmt = mix(s.glossAmt, o.glossAmt, L.t);
         s.glossPow = mix(s.glossPow, o.glossPow, L.t);
@@ -582,10 +766,11 @@ struct PanelCfg {
 
 static PanelCfg resolvePanels(thread const LevelMix &L)
 {
-    constant LevelDef &A = kLevels[L.ia];
-    constant LevelDef &B = kLevels[L.ib];
+    constant LevelDef &A = kLevels[L.a.base];
+    constant LevelDef &B = kLevels[L.b.base];
     PanelCfg P;
-    P.lightA = A.lightCol;  P.lightB = B.lightCol;
+    P.lightA = A.lightCol * L.a.lightScale * L.a.lightTint;
+    P.lightB = B.lightCol * L.b.lightScale * L.b.lightTint;
     P.probA = A.panelProb;  P.probB = B.panelProb;
     P.extA = A.panelExt;    P.extB = B.panelExt;
     P.t = L.t;
@@ -661,8 +846,8 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
                     texture2d<float> woodTex, float hasWood,
                     float2 mCen, float2 mFwd, MapCfg cfg)
 {
-    constant LevelDef &A = kLevels[L.ia];
-    constant LevelDef &B = kLevels[L.ib];
+    constant LevelDef &A = kLevels[L.a.base];
+    constant LevelDef &B = kLevels[L.b.base];
     PanelCfg P = resolvePanels(L);
     int kind = 2;
     if (n.y > 0.6 && p.y < 1.0) kind = 0;
@@ -685,6 +870,32 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
     }
 
     Surface s = surfaceAt(p, n, kind, L, waterY, wallTex, hasTex, woodTex, hasWood, cfg);
+
+    // Props wear their own material rather than inheriting the floor's. Four
+    // corner tests, but only for points low enough to be a prop, and only once
+    // per shaded pixel rather than once per march step.
+    if (cfg.propProb > 0.0 && p.y < kPropTop + 0.06) {
+        int2 ci = int2(floor(p.xz / kCell));
+        for (int k = 0; k < 4; ++k) {
+            int2 corner = ci + int2(k & 1, k >> 1);
+            float hp;
+            float dp = propAt(p.xz - float2(corner) * kCell, p, corner, cfg, hp);
+            if (dp < 0.025) {
+                float kind2 = fract(hp * 91.7);
+                float3 pc = (kind2 < 0.34) ? float3(0.34, 0.27, 0.18)    // desk, wood
+                          : (kind2 < 0.68) ? float3(0.16, 0.17, 0.20)    // chair, dark plastic
+                                           : float3(0.44, 0.34, 0.22);   // cardboard
+                // Keep this nearly flat. An fbm in p.xz is constant in y, so
+                // any strength here paints vertical streaks down the sides and
+                // the prop reads as melted rather than manufactured.
+                float wear = 0.94 + 0.10 * vnoise(p.xz * 3.0 + hp * 40.0);
+                s.albedo = pc * wear * (n.y > 0.6 ? 1.12 : 1.0);
+                s.glossAmt = (kind2 < 0.68) ? 0.10 : 0.02;
+                s.bumpAmt = 0.0;
+                break;
+            }
+        }
+    }
 
     // Real woodchip relief bump, wherever the live mix uses wallpaper
     float paper = (A.wallFam == kFamPaper ? 1.0 - L.t : 0.0)
@@ -715,7 +926,11 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
     float ao = calcAO(p, n, cfg);
     float3 V = -rd;
 
-    float3 amb = mixCol(L, A.amb, B.amb) * mix(1.0, 0.55, L.horror);
+    // Ambient follows the light dial on a curve, not linearly: a fever level at
+    // 0.15 light should be gloomy and legible, not a black screen.
+    float3 amb = mixCol(L, A.amb * sqrt(L.a.lightScale) * L.a.lightTint,
+                           B.amb * sqrt(L.b.lightScale) * L.b.lightTint)
+               * mix(1.0, 0.55, L.horror);
     float3 col = s.albedo * amb * (0.35 + 0.65 * ao);
 
     float bestLum = 0.0, bestDist = 0.0;
@@ -773,14 +988,15 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
 
 static float3 fogColour(thread const LevelMix &L)
 {
-    return mixCol(L, kLevels[L.ia].fogCol, kLevels[L.ib].fogCol);
+    return mixCol(L, kLevels[L.a.base].fogCol, kLevels[L.b.base].fogCol);
 }
 
 static float3 applyFog(float3 col, float t, thread const LevelMix &L, float2 q, float time)
 {
-    constant LevelDef &A = kLevels[L.ia];
-    constant LevelDef &B = kLevels[L.ib];
-    float den = mixF(L, A.fogDen, B.fogDen) * mix(1.0, 1.45, L.horror);
+    constant LevelDef &A = kLevels[L.a.base];
+    constant LevelDef &B = kLevels[L.b.base];
+    float den = mixF(L, A.fogDen * L.a.fogScale, B.fogDen * L.b.fogScale)
+              * mix(1.0, 1.45, L.horror);
     den *= 0.72 + 0.55 * fbm(q * 0.09 + time * 0.02);   // patchy, slowly drifting haze
     return mix(col, fogColour(L), 1.0 - exp(-t * den));
 }
@@ -820,8 +1036,8 @@ static float figureMask(float2 uv)
 static float3 applyEntity(float3 col, float3 ro, float3 rd, float tHit,
                           float4 entPos, float4 entCfg, thread const LevelMix &L, float time)
 {
-    constant LevelDef &A = kLevels[L.ia];
-    constant LevelDef &B = kLevels[L.ib];
+    constant LevelDef &A = kLevels[L.a.base];
+    constant LevelDef &B = kLevels[L.b.base];
     float alpha = entPos.w;
     if (alpha < 0.002) return col;
 
@@ -835,7 +1051,7 @@ static float3 applyEntity(float3 col, float3 ro, float3 rd, float tHit,
     float2 uv = float2(dot(off, right), dot(off, up)) / max(entCfg.y, 0.05);
     if (max(fabs(uv.x), fabs(uv.y)) > 1.3) return col;
 
-    float den = mixF(L, A.fogDen, B.fogDen);
+    float den = mixF(L, A.fogDen * L.a.fogScale, B.fogDen * L.b.fogScale);
     if (entCfg.x < 0.5) {
         // Smiler: emissive, so the bloom chain gives it a halo in the haze
         float m = smilerMask(uv);
@@ -881,15 +1097,15 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
                           + U.upTanY.xyz * (ndc.y * U.upTanY.w));
 
     LevelMix L;
-    L.ia = clamp(int(U.level.x), 0, 5);
-    L.ib = clamp(int(U.level.y), 0, 5);
-    L.t = clamp(U.level.z, 0.0, 1.0);
+    L.a = unpackLook(U.lookA0, U.lookA1, U.lookA2);
+    L.b = unpackLook(U.lookB0, U.lookB1, U.lookB2);
+    L.t = clamp(U.level.x, 0.0, 1.0);
     L.horror = clamp(U.horror.x, 0.0, 1.0);
-    constant LevelDef &A = kLevels[L.ia];
-    constant LevelDef &B = kLevels[L.ib];
+    constant LevelDef &A = kLevels[L.a.base];
+    constant LevelDef &B = kLevels[L.b.base];
 
     float t = U.eyeTime.w;
-    float waterY = U.level.w;
+    float waterY = U.level.y;
     float globalLight = U.mode.y;
 
     MapCfg cfg;
@@ -897,7 +1113,7 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
     cfg.doorW = mixF(L, A.doorW, B.doorW);
     cfg.doorH = mixF(L, A.doorH, B.doorH);
     cfg.doorR = mixF(L, A.doorR, B.doorR);
-    cfg.pillarR = mixF(L, A.pillarR, B.pillarR);
+    cfg.pillarR = mixF(L, A.pillarR * L.a.pillarScale, B.pillarR * L.b.pillarScale);
     cfg.roundness = mixF(L, A.roundness, B.roundness);
     cfg.skirt = mixF(L, A.skirt, B.skirt);
     cfg.wainscotH = mixF(L, A.wainscotH, B.wainscotH);
@@ -905,6 +1121,10 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
     cfg.leanAmt = mixF(L, A.leanAmt, B.leanAmt);
     cfg.partProb = mixF(L, A.partProb, B.partProb);
     cfg.soffitProb = mixF(L, A.soffitProb, B.soffitProb);
+    cfg.pillarProb = mixF(L, A.pillarProb, B.pillarProb);
+    cfg.archProb = mixF(L, A.archProb, B.archProb);
+    cfg.bowAmt = mixF(L, A.bowAmt, B.bowAmt);
+    cfg.propProb = mixF(L, A.propProb, B.propProb);
     cfg.seed = as_type<uint>(U.fwdSeed.w);
 
     bool hit;

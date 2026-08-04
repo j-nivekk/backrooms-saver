@@ -29,6 +29,30 @@ private let kLevelCeilH: [Float]    = [3.05, 3.05, 4.25, 2.85, 2.75, 3.20]
 private let kLevelWaterY: [Float]   = [-0.30, -0.30, 0.16, -0.30, -0.30, -0.30]
 private let kLevelDarkness: [Float] = [0.15, 0.55, 0.10, 0.20, 0.45, 1.00]
 
+/// What the shader needs to draw one level: which level it fundamentally is
+/// (geometry knobs, panels, fog), which levels its surfaces are *wearing*, and
+/// a few scalar distortions. For a canon level everything agrees and every
+/// scale is 1; a fever level is the same struct with the pieces shuffled.
+public struct Look {
+    public var base = 0
+    public var floorSrc = 0, wallSrc = 0, ceilSrc = 0
+    public var lightScale: Float = 1
+    public var lightTint = SIMD3<Float>(1, 1, 1)
+    public var fogScale: Float = 1
+    public var pillarScale: Float = 1
+    public var ceilScale: Float = 1
+    public var waterY: Float = -0.30
+    public var isFever = false
+
+    static func canon(_ level: Int) -> Look {
+        var k = Look()
+        k.base = level
+        k.floorSrc = level; k.wallSrc = level; k.ceilSrc = level
+        k.waterY = kLevelWaterY[level]
+        return k
+    }
+}
+
 /// Level pairs close enough to melt into one another - each shares a material
 /// family or a palette, so the crossfade lands on something plausible the whole
 /// way through. Habitable -> MotionLights is the same concrete with the lights
@@ -83,8 +107,8 @@ public struct DirectorFrame {
     public var glitch: Float = 0
     public var fade: Float = 1
     public var globalLight: Float = 1
-    public var levelA = 0
-    public var levelB = 0
+    public var lookA = Look.canon(0)
+    public var lookB = Look.canon(0)
     public var blend: Float = 0
     public var waterY: Float = -0.3
     public var ceilH: Float = 3.05
@@ -105,8 +129,11 @@ public struct DirectorFrame {
 public final class Director {
     let seed: UInt32
     let preview: Bool
-    public var forcedLevel: Int?
     public var forcedShot: String?
+    /// Debug: pin one look for the whole run (backdev --level / --fever).
+    private var forcedLook: Look?
+    public func pin(level: Int) { forcedLook = Look.canon(min(max(level, 0), kLevelCount - 1)) }
+    public func pinFever() { forcedLook = feverLook() }
     /// Defaults to the kHorror dial; backdev's --horror overrides it per run.
     public var horror: Float = kHorror
     /// Debug only: pin an entity on screen (0 smiler, 1 figure) for tuning.
@@ -348,7 +375,7 @@ public final class Director {
         phaseT = preview ? 14 : 34
         fadeStart = -0.7          // fade in from black on launch
         pendingTeleport = false
-        levelCur = Int.random(in: 0..<kLevelCount, using: &rng)
+        lookCur = Look.canon(Int.random(in: 0..<kLevelCount, using: &rng))
         levelT = holdDuration() * Float.random(in: 0.3...1.0, using: &rng)
     }
 
@@ -430,8 +457,9 @@ public final class Director {
     // random stretch, then on to a randomly chosen other one. No fixed order.
     // Neighbouring palettes melt; distant ones noclip.
 
-    private var levelCur = 0
-    private var levelNext = 0
+    private var lookCur = Look.canon(0)
+    private var lookNext = Look.canon(0)
+    private var levelCur: Int { lookCur.base }
     private var levelHolding = true
     private var levelT: Float = 0
     private var levelTransLen: Float = 30
@@ -442,12 +470,61 @@ public final class Director {
                 : Float.random(in: 90...160, using: &rng)
     }
 
+    /// A fever level: a real level wearing other levels' surfaces, with the
+    /// lighting gone wrong in one of a few specific ways. Random per axis, but
+    /// never random per pixel - it is still one coherent place.
+    private func feverLook() -> Look {
+        var k = Look.canon(Int.random(in: 0..<kLevelCount, using: &rng))
+        k.isFever = true
+        // At least one surface always comes from elsewhere, or it is not a fever
+        for _ in 0..<Int.random(in: 1...3, using: &rng) {
+            let other = Int.random(in: 0..<kLevelCount, using: &rng)
+            switch Int.random(in: 0...2, using: &rng) {
+            case 0: k.floorSrc = other
+            case 1: k.wallSrc = other
+            default: k.ceilSrc = other
+            }
+        }
+        switch Int.random(in: 0...5, using: &rng) {
+        case 0: k.lightScale = Float.random(in: 0.08...0.22, using: &rng)   // nearly out
+        case 1: k.lightScale = Float.random(in: 2.6...4.2, using: &rng)     // blinding
+        case 2: k.lightTint = SIMD3(1.00, 0.34, 0.26); k.lightScale = 1.5   // red
+        case 3: k.lightTint = SIMD3(0.44, 1.00, 0.54); k.lightScale = 1.2   // sick green
+        case 4: k.lightTint = SIMD3(0.58, 0.72, 1.00); k.lightScale = 1.1   // cold
+        default: break                                                      // lighting is fine, materials are not
+        }
+        k.fogScale = Float.random(in: 0.45...2.0, using: &rng)
+        k.pillarScale = Float.random(in: 0.30...1.90, using: &rng)
+        k.ceilScale = Float.random(in: 0.78...1.35, using: &rng)
+        // Water anywhere, not just the poolrooms
+        if Float.random(in: 0..<1, using: &rng) < 0.28 {
+            k.waterY = Float.random(in: 0.04...0.17, using: &rng)
+        }
+        return k
+    }
+
+    private func nextLook() -> Look {
+        if Float.random(in: 0..<1, using: &rng) < 0.32 {
+            var k = feverLook()
+            // Bias a third of fevers to the level we are already in, so the
+            // "this room is going wrong" melt happens often enough to notice.
+            if Float.random(in: 0..<1, using: &rng) < 0.34 { k.base = levelCur }
+            return k
+        }
+        return Look.canon((0..<kLevelCount).filter { $0 != levelCur }.randomElement(using: &rng)!)
+    }
+
     private func updateLevels(_ dt: Float) {
         levelT -= dt
         guard levelT <= 0 else { return }
         if levelHolding {
-            levelNext = (0..<kLevelCount).filter { $0 != levelCur }.randomElement(using: &rng)!
-            levelNoclip = !levelsMelt(levelCur, levelNext)
+            lookNext = nextLook()
+            // Melt when the two share a base or sit next to each other, fever or
+            // not. Melting into a fever of the *same* base is the best thing the
+            // whole system does: the room you are standing in slowly goes wrong
+            // around you - the lights sink, the water comes up - without a cut.
+            levelNoclip = !(lookCur.base == lookNext.base
+                            || levelsMelt(lookCur.base, lookNext.base))
             if levelNoclip {
                 // Tear the image, cut to black, come back somewhere else. The
                 // swap itself lands mid-blackout, so it is never seen; 0.65 s
@@ -461,7 +538,7 @@ public final class Director {
             levelT = levelTransLen
             levelHolding = false
         } else {
-            levelCur = levelNext
+            lookCur = lookNext
             levelT = holdDuration()
             levelHolding = true
         }
@@ -630,17 +707,18 @@ public final class Director {
 
     public func frame() -> DirectorFrame {
         var f = DirectorFrame()
-        let forced = forcedLevel.map { min(max($0, 0), kLevelCount - 1) }
-        let la = forced ?? levelCur
-        let lb = forced ?? levelNext
-        let b = forced != nil ? 0 : levelBlend()
-        f.levelA = la
-        f.levelB = lb
+        let ka = forcedLook ?? lookCur
+        let kb = forcedLook ?? (levelHolding ? lookCur : lookNext)
+        let b = forcedLook != nil ? 0 : levelBlend()
+        f.lookA = ka
+        f.lookB = kb
         f.blend = b
         f.horror = horror
-        f.ceilH = kLevelCeilH[la] + (kLevelCeilH[lb] - kLevelCeilH[la]) * b
+        let ca = kLevelCeilH[ka.base] * ka.ceilScale
+        let cb = kLevelCeilH[kb.base] * kb.ceilScale
+        f.ceilH = ca + (cb - ca) * b
         // Water rises late in the melt and drains early, as it did before
-        let wa = kLevelWaterY[la], wb = kLevelWaterY[lb]
+        let wa = ka.waterY, wb = kb.waterY
         let we = wb > wa ? powf(b, 1.5) : 1 - powf(1 - b, 1.5)
         f.waterY = wa + (wb - wa) * we
 
