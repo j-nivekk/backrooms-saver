@@ -239,7 +239,7 @@ public final class BackroomsRenderer {
             fwdSeed: SIMD4(f.fwd.x, f.fwd.y, f.fwd.z, Float(bitPattern: director.seed)),
             level: SIMD4(f.blend, f.waterY, 0, 0),
             mode: SIMD4(f.cctv, f.globalLight, f.ceilH, hasWallTexture ? 1 : 0),
-            horror: SIMD4(f.horror, hasWoodTexture ? 1 : 0, 0, 0),
+            horror: SIMD4(f.horror, hasWoodTexture ? 1 : 0, f.ceilAmp, f.ceilPhase),
             lookA0: la.0, lookA1: la.1, lookA2: la.2,
             lookB0: lb.0, lookB1: lb.1, lookB2: lb.2,
             motion: SIMD4(f.motionCentre.x, f.motionCentre.y, f.motionFwd.x, f.motionFwd.y),

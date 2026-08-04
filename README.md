@@ -13,7 +13,8 @@ its coordinates every frame. Walk for an hour and you will not repeat a room.
 
 Every archway, column and doorway is drawn from the same hashes: widths, crown
 heights, how round or shallow an arch springs, whether it leans, whether a
-column tapers or flares or has simply given up and tilted.
+column tapers or flares or has simply given up and tilted. The ceiling drifts
+too, so rooms run from cramped to cathedral without a seam anywhere.
 
 ## Six levels
 

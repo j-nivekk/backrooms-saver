@@ -28,6 +28,18 @@ private let kLevelCount = 6
 private let kLevelCeilH: [Float]    = [3.05, 3.05, 4.25, 2.85, 2.75, 3.20]
 private let kLevelWaterY: [Float]   = [-0.30, -0.30, 0.16, -0.30, -0.30, -0.30]
 private let kLevelDarkness: [Float] = [0.15, 0.55, 0.10, 0.20, 0.45, 1.00]
+/// How far the ceiling drifts, in metres either side of the level's base height.
+/// Built environments keep theirs flat; grand and industrial spaces roam.
+///          Lobby Habitable Poolrooms Office Hotel Motion
+private let kLevelCeilAmp: [Float] = [0.35, 0.70, 0.90, 0.22, 0.30, 0.60]
+
+/// Mirror of ceilDrift in Backrooms.metal. Cosmetic rather than load-bearing -
+/// it only decides how high the CCTV camera hangs - but keep them in step.
+private func ceilDrift(_ xz: SIMD2<Float>, _ phase: Float) -> Float {
+    0.40 * sinf(xz.x * 0.083 + phase)
+  + 0.34 * sinf(xz.y * 0.061 + phase * 1.7)
+  + 0.26 * sinf((xz.x + xz.y) * 0.037 + phase * 2.3)
+}
 
 /// What the shader needs to draw one level: which level it fundamentally is
 /// (geometry knobs, panels, fog), which levels its surfaces are *wearing*, and
@@ -134,6 +146,8 @@ public struct DirectorFrame {
     public var blend: Float = 0
     public var waterY: Float = -0.3
     public var ceilH: Float = 3.05
+    public var ceilAmp: Float = 0
+    public var ceilPhase: Float = 0
     public var horror: Float = 0
     /// Where Level 94's lights think "you" are. During a drift that is the
     /// camera; during a CCTV shot the walk carries on without us, so lights
@@ -168,6 +182,8 @@ public final class Director {
 
     private var time: Float = 0
     private var rng: SplitMix
+    /// Must match the shader's derivation from the same seed.
+    private var ceilPhase: Float { Float(seed & 0xFFFF) * 0.0001 }
 
     // MARK: - World queries (mirror of the shader)
 
@@ -744,6 +760,9 @@ public final class Director {
         let ca = kLevelCeilH[ka.base] * ka.ceilScale
         let cb = kLevelCeilH[kb.base] * kb.ceilScale
         f.ceilH = ca + (cb - ca) * b
+        let aa = kLevelCeilAmp[ka.base], ab = kLevelCeilAmp[kb.base]
+        f.ceilAmp = aa + (ab - aa) * b
+        f.ceilPhase = ceilPhase
         // Water rises late in the melt and drains early, as it did before
         let wa = ka.waterY, wb = kb.waterY
         let we = wb > wa ? powf(b, 1.5) : 1 - powf(1 - b, 1.5)
@@ -787,7 +806,10 @@ public final class Director {
             f.tanX = 0.68
             f.cctv = 0
         case .cctv:
-            f.eye = SIMD3(camXZ.x, f.ceilH - 0.42, camXZ.y)
+            // Hang under whatever ceiling is actually overhead, not the base
+            // 2.2 m floor matches kCeilMin in the shader - see the note there
+            let localCeil = max(f.ceilH + f.ceilAmp * ceilDrift(camXZ, ceilPhase), 2.20)
+            f.eye = SIMD3(camXZ.x, localCeil - 0.42, camXZ.y)
             let target = SIMD3(camTargetXZ.x, camTargetY, camTargetXZ.y)
             var d = simd_normalize(target - f.eye)
             let pan = camPanAmp * sinf(time * camPanFreq + camPanPhase)

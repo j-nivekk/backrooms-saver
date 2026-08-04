@@ -126,6 +126,31 @@ bar, 3×5-pixel-font overlay text — lives in the composite pass and is faded i
 per shot; cuts between shots spike a glitch uniform that tears the image into
 displaced bands.
 
+### The ceiling drifts
+
+The ceiling is not one flat plane over the world. `ceilDrift` sums three sines
+with incommensurate periods, scaled by a per-level amplitude (`kLevelCeilAmp` in
+`Director.swift`, 0.22 m in the Office up to 0.90 m in the Poolrooms).
+
+Sines rather than a hashed per-region height, deliberately. A stepped ceiling
+makes `top - p.y` an *over-estimate* near the step, because the vertical face of
+the step is nearer than the slab above — and over-estimates tunnel. A worked
+example: regions at 3.0 m and 4.0 m, a point in the taller one at y = 3.5 and
+5 cm from the boundary, gives 0.50 m from the naive formula against 0.05 m
+true. Sines keep |grad| near 0.05 per metre of amplitude, so the field stays
+Lipschitz and nothing tunnels.
+
+`ceilAt` clamps to **2.2 m**, which is load-bearing rather than taste: a
+low-ceilinged level under a fever's `ceilScale` starts near 2.1 m, and the drift
+would take it under the 1.55 m eye — with the CCTV camera, which mounts 0.42 m
+below the ceiling, ending up on the floor. `Director.swift` mirrors both the
+drift and the clamp so the camera hangs under the ceiling actually above it.
+
+Only the ceiling plane in `map()` reads the local height. Soffits, arches and
+wall lean use the base: they are all clamped for headroom anyway, and calling
+`ceilAt` inside `wallSDF` would pay for it on every one of the ~500 wall
+evaluations a pixel makes.
+
 **Panel-light falloff must reach zero within 1.5× the panel pitch horizontally**
 (the 3×3 light window), or lights pop out of the window and leave visible seams
 on the floor.

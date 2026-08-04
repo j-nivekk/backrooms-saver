@@ -13,7 +13,7 @@ struct RMUniforms {
     float4 fwdSeed;     // xyz forward basis, w world seed (as bits)
     float4 level;       // x blend A->B, y water height, zw unused
     float4 mode;        // x cctv, y global light, z ceiling height, w wall texture present
-    float4 horror;      // x horror amount, y wood texture present, zw unused
+    float4 horror;      // x horror, y wood texture present, z ceiling drift amp, w its phase
     // Two "looks", one per live level. A look is a base level plus per-surface
     // material sources and a few scalar overrides, which is what lets the
     // Director synthesise fever variants that mix elements between levels.
@@ -124,6 +124,7 @@ static float fbm(float2 p)
 // ---------------------------------------------------------------------------
 
 struct MapCfg {
+    float ceilAmp, ceilPhase;   // ceiling drift: amplitude in metres, world phase
     float ceilH, doorW, doorH, doorR, pillarR, roundness, skirt, wainscotH;
     // 1 / (0.35 * wainscotH - wainscotH), precomputed. wallSDF runs ~500 times
     // per pixel and a smoothstep with variable edges hides a divide in there,
@@ -181,6 +182,33 @@ static float propAt(float2 q, float3 p, int2 corner, MapCfg cfg, thread float &h
     // straddle that jump and band the prop with false occlusion. The exact
     // union is only a couple of boxes, so just pay for it.
     return propSDF(lp, hp);
+}
+
+// The ceiling is not one flat plane over the whole world - it drifts.
+//
+// Sines rather than a hashed per-region height, for two reasons. A stepped
+// ceiling makes `top - p.y` an OVER-estimate near the step (the vertical face
+// is nearer than the slab), which tunnels rays. And sines are trivially
+// mirrored on the CPU, which the CCTV camera needs so it can mount itself under
+// the ceiling that is actually above it. Periods are incommensurate, so the
+// drift never visibly repeats; |grad| stays around 0.05 per metre of amplitude,
+// so the field stays comfortably Lipschitz.
+static float ceilDrift(float2 xz, float phase)
+{
+    return 0.40 * sin(xz.x * 0.083 + phase)
+         + 0.34 * sin(xz.y * 0.061 + phase * 1.7)
+         + 0.26 * sin((xz.x + xz.y) * 0.037 + phase * 2.3);
+}
+
+// The floor of 2.2 m is load-bearing, not taste. A low-ceilinged level under a
+// fever's ceilScale can start near 2.1 m, and the drift then takes it under the
+// 1.55 m eye - and the CCTV camera, which mounts 0.42 m below the ceiling, ends
+// up on the floor. max() of two Lipschitz functions is still Lipschitz.
+constant float kCeilMin = 2.20;
+
+static float ceilAt(float2 xz, MapCfg cfg)
+{
+    return max(cfg.ceilH + cfg.ceilAmp * ceilDrift(xz, cfg.ceilPhase), kCeilMin);
 }
 
 // Geometry variety lives here, but NOTHING may change passability: the Swift
@@ -283,7 +311,11 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
 
 static float map(float3 p, MapCfg cfg)
 {
-    float d = min(p.y, cfg.ceilH - p.y);
+    // Only the ceiling plane itself needs the local height. Soffits, arches and
+    // wall lean read the base height instead: they are all clamped to keep
+    // headroom regardless, and putting ceilAt in wallSDF would pay for it on
+    // every one of the ~500 wall evaluations a pixel makes.
+    float d = min(p.y, ceilAt(p.xz, cfg) - p.y);
 
     float2 cf = floor(p.xz / kCell);
     int2 ci = int2(cf);
@@ -857,7 +889,7 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
     else if (n.y < -0.6) kind = 1;
 
     // Direct hit on a lit ceiling panel: pure emission (bloom does the rest).
-    if (kind == 1 && p.y > cfg.ceilH - 0.05) {
+    if (kind == 1 && p.y > ceilAt(p.xz, cfg) - 0.05) {
         int2 pc = int2(floor(p.xz / kPanelPitch));
         float2 ext;
         float3 em = panelEmission(pc, P, t, globalLight, cfg.seed, mCen, mFwd, ext);
@@ -947,7 +979,7 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
         float3 em = panelEmission(pc, P, t, globalLight, cfg.seed, mCen, mFwd, ext);
         if (dot(em, em) < 1e-6) continue;
         float2 lc = (float2(pc) + 0.5) * kPanelPitch;
-        float3 lp = float3(lc.x, cfg.ceilH - 0.07, lc.y);
+        float3 lp = float3(lc.x, ceilAt(lc, cfg) - 0.07, lc.y);
         float3 toL = lp - p;
         float d2 = dot(toL, toL);
         float3 L = toL * rsqrt(max(d2, 1e-5));
@@ -1113,6 +1145,8 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
 
     MapCfg cfg;
     cfg.ceilH = U.mode.z;
+    cfg.ceilAmp = U.horror.z;
+    cfg.ceilPhase = U.horror.w;
     cfg.doorW = mixF(L, A.doorW, B.doorW);
     cfg.doorH = mixF(L, A.doorH, B.doorH);
     cfg.doorR = mixF(L, A.doorR, B.doorR);
