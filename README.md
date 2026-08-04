@@ -80,11 +80,14 @@ To watch one without installing:
 every image above was made. See [docs/internals.md](docs/internals.md) for its
 flags and for how the thing actually works.
 
-## Credits
+## Licence and credits
+
+The code is [MIT](LICENSE).
 
 Textures are from [ambientCG](https://ambientcg.com) (Wallpaper001A/001C and
-Wood051), all **CC0 1.0** and bundled directly. Everything else — geometry,
-materials, lighting, grain — is generated at runtime.
+Wood051), all **CC0 1.0** and bundled directly, so redistributing the built
+saver is fine. Everything else — geometry, materials, lighting, grain — is
+generated at runtime.
 
 The Backrooms began as a 4chan post in 2018 and grew into a large collaborative
 fiction; the levels here are affectionate interpretations of the community's
