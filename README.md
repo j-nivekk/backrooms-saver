@@ -1,4 +1,4 @@
-# Backrooms
+# Backrooms.saver
 
 A generative liminal-space screen saver for macOS. An endless interior that
 nobody built and nobody is in, toured by a camera that alternates between slow
