@@ -420,7 +420,10 @@ struct LevelDef {
     float  motion;        // 1 = panels ignite by proximity to the eye
     float  darkness;      // 1 = entities read as Smilers, 0 = as figures
     float  pillarProb;    // how often a corner grows a real column
-    float  archProb;      // how often an open edge becomes an archway
+    float  archProb;      // how often an open edge becomes an archway.
+                          // Keep this low: an arch should be a find, not
+                          // the default, and every edge that is not one is
+                          // free to be a soffit or an honest opening.
     float  bowAmt;        // gentle lateral bow across a wall span
     // Chance a corner owns a crate. OFF (0) on every level by default: the
     // crates render honestly at a distance but band at close range, because
@@ -441,7 +444,7 @@ constant LevelDef kLevels[6] = {
         0.16, 0.00, 0.016, 0.130,
         0.06, 0.30, 0.25,
         0.0, 0.15,
-        0.18, 0.10, 0.05, 0.0
+        0.18, 0.03, 0.05, 0.0
     },
     {   // 1 - Level 1, Habitable Zone
         float3(0.70, 0.95, 0.78) * 9.5, 0.30, float2(0.68, 0.07),
@@ -454,7 +457,7 @@ constant LevelDef kLevels[6] = {
         0.45, 0.00, 0.000, 0.130,
         0.22, 0.35, 0.30,
         0.0, 0.55,
-        0.34, 0.14, 0.10, 0.0
+        0.34, 0.05, 0.10, 0.0
     },
     {   // 2 - Level 37, Poolrooms
         float3(0.85, 0.93, 1.05) * 8.0, 0.42, float2(0.42, 0.42),
@@ -467,7 +470,7 @@ constant LevelDef kLevels[6] = {
         0.40, 1.00, 0.000, 0.130,
         0.05, 0.15, 0.15,
         0.0, 0.10,
-        0.22, 0.42, 0.04, 0.0
+        0.22, 0.15, 0.04, 0.0
     },
     {   // 3 - Level 4, Abandoned Office
         float3(0.92, 0.96, 1.00) * 6.0, 0.62, float2(0.60, 0.32),
@@ -480,7 +483,7 @@ constant LevelDef kLevels[6] = {
         0.20, 0.00, 0.012, 0.100,
         0.04, 0.62, 0.22,
         0.0, 0.20,
-        0.15, 0.06, 0.03, 0.0
+        0.15, 0.02, 0.03, 0.0
     },
     {   // 4 - Level 5, Terror Hotel
         float3(1.00, 0.84, 0.58) * 6.5, 0.34, float2(0.16, 0.16),
@@ -493,7 +496,7 @@ constant LevelDef kLevels[6] = {
         0.18, 0.35, 0.020, 0.950,
         0.03, 0.20, 0.18,
         0.0, 0.45,
-        0.20, 0.34, 0.06, 0.0
+        0.20, 0.12, 0.06, 0.0
     },
     {   // 5 - Level 94, Motion Lights
         float3(0.88, 0.94, 1.00) * 11.0, 0.70, float2(0.55, 0.30),
@@ -506,7 +509,7 @@ constant LevelDef kLevels[6] = {
         0.30, 0.00, 0.000, 0.130,
         0.10, 0.25, 0.28,
         1.0, 1.00,
-        0.30, 0.12, 0.08, 0.0
+        0.30, 0.04, 0.08, 0.0
     },
 };
 
