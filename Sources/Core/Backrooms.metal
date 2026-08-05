@@ -591,10 +591,61 @@ static float  mixF(thread const LevelMix &L, float va, float vb) { return mix(va
 
 struct Surface {
     float3 albedo;
-    float glossAmt;
-    float glossPow;
+    float roughness;   // perceptual: 0 mirror, 1 fully diffuse
+    float metallic;
     float bumpAmt;
 };
+
+// ---------------------------------------------------------------------------
+// Metallic/roughness BRDF. GGX distribution, height-correlated Smith
+// visibility, Schlick Fresnel.
+//
+// The diffuse term deliberately keeps a wrap (dot * 0.62 + 0.38) rather than a
+// true clamped N.L. It is not physical - it is a stand-in for the interreflected
+// light a real room is full of, and it is most of why this place reads as
+// flatly, evenly lit rather than dramatic. Losing it would look more "correct"
+// and less like the Backrooms. Replace it only when there is real indirect
+// light to replace it with.
+// ---------------------------------------------------------------------------
+
+static float D_GGX(float ndh, float a)
+{
+    float a2 = a * a;
+    float d = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265 * d * d, 1e-7);
+}
+
+static float V_SmithGGX(float ndv, float ndl, float a)
+{
+    float a2 = a * a;
+    float gv = ndl * sqrt(ndv * ndv * (1.0 - a2) + a2);
+    float gl = ndv * sqrt(ndl * ndl * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 1e-5);   // includes the 1/(4 ndl ndv)
+}
+
+static float3 F_Schlick(float3 f0, float vdh)
+{
+    float f = pow(clamp(1.0 - vdh, 0.0, 1.0), 5.0);
+    return f0 + (1.0 - f0) * f;
+}
+
+/// Karis representative point: the ceiling panels are rectangles, not points.
+/// Intersect the reflection ray with the panel plane, clamp into the rectangle,
+/// and shade toward that instead of the centre. This is what turns a small hot
+/// dot on glazed tile into the broad soft streak a real troffer casts.
+static float3 rectRepresentativePoint(float3 p, float3 R, float3 centre, float2 ext)
+{
+    float denom = R.y;
+    if (denom > 1e-4) {                       // ray heading up toward the ceiling
+        float tPl = (centre.y - p.y) / denom;
+        if (tPl > 0.0) {
+            float3 hit = p + R * tPl;
+            float2 off = clamp(hit.xz - centre.xz, -ext, ext);
+            return float3(centre.x + off.x, centre.y, centre.z + off.y);
+        }
+    }
+    return centre;
+}
 
 // Channel-packed CC0 wallpaper detail (ambientCG Wallpaper001A + 001C):
 // R = clean woodchip relief, G = damaged relief, B = damage colour luminance.
@@ -616,8 +667,8 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
 {
     constant LevelDef &L = kLevels[li];
     Surface s;
-    s.glossAmt = 0.0;
-    s.glossPow = 24.0;
+    s.roughness = 0.90;
+    s.metallic = 0.0;
     s.bumpAmt = 0.0;
 
     int fam = (kind == 0) ? L.floorFam : ((kind == 1) ? L.ceilFam : L.wallFam);
@@ -680,7 +731,7 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
                     * smoothstep(1.1, 0.35, p.y);
         a *= 1.0 - 0.20 * scuff;
         a *= 0.93 + 0.14 * hcell(int2(floor(floor(p.xz / kCell) / 6.0)), kSaltTint, cfg.seed);
-        s.glossAmt = 0.03;
+        s.roughness = 0.86;
         s.bumpAmt = (hasTex > 0.5) ? 0.03 : 0.10;
     } else if (fam == kFamDrywall) {
         a = base * (0.94 + 0.10 * fbm(float2(along * 0.6, p.y * 0.6)));
@@ -691,19 +742,19 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
         float scuff = smoothstep(0.62, 0.90, fbm(float2(along * 2.2, p.y * 0.8) + 2.3))
                     * smoothstep(1.3, 0.3, p.y);
         a *= 1.0 - L.wallParam * 0.45 * scuff;
-        s.glossAmt = 0.04;
+        s.roughness = 0.90;
         s.bumpAmt = 0.06;
     } else if (fam == kFamConcrete) {
         if (kind == 0) {
             a = base * (0.85 + 0.25 * fbm(p.xz * 1.3));
-            s.glossAmt = 0.10; s.bumpAmt = 0.28;
+            s.roughness = 0.72; s.bumpAmt = 0.28;
         } else if (kind == 1) {
             a = base * (0.9 + 0.2 * fbm(p.xz * 0.9));
-            s.glossAmt = 0.05; s.bumpAmt = 0.12;
+            s.roughness = 0.85; s.bumpAmt = 0.12;
         } else {
             a = base * (0.80 + 0.30 * fbm(float2(along, p.y) * 1.7));
             a *= 1.0 - 0.35 * smoothstep(1.2, 0.0, p.y) * fbm(float2(along * 0.8, 3.1));
-            s.glossAmt = 0.05; s.bumpAmt = 0.50;
+            s.roughness = 0.82; s.bumpAmt = 0.50;
         }
     } else if (fam == kFamTile) {
         float2 tc = (kind == 2) ? float2(along, p.y) : p.xz;
@@ -715,8 +766,9 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
         if (kind == 2 && waterY > -0.1) {   // old waterline stain on the tile
             a *= 1.0 - 0.28 * exp(-fabs(p.y - (waterY + 0.05)) * 22.0);
         }
-        s.glossAmt = (kind == 0) ? 0.55 : 0.40;
-        s.glossPow = 70.0;
+        // glazed ceramic is genuinely smooth - this is the biggest single
+        // material change, and what finally makes the poolrooms read as tile
+        s.roughness = (kind == 0) ? 0.18 : 0.26;
         s.bumpAmt = (kind == 2) ? 0.05 : 0.02;
     } else if (fam == kFamAcoustic) {
         a = base * (0.95 + 0.09 * vhash(floor(p.xz)));
@@ -725,7 +777,7 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
         a *= 1.0 - 0.22 * smoothstep(0.47, 0.5, max(g.x, g.y));
     } else if (fam == kFamPlaster) {
         a = base * (0.95 + 0.09 * fbm(p.xz * 1.1));
-        s.glossAmt = 0.02;
+        s.roughness = 0.88;
         s.bumpAmt = 0.05;
     } else if (fam == kFamWood) {
         // Real grain if we have it, stretched fbm if not, plus panel divisions
@@ -737,8 +789,7 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
         }
         float seam = smoothstep(0.035, 0.012, fabs(fract(along / 0.80) - 0.5) * 0.80);
         a *= 1.0 - 0.35 * seam;
-        s.glossAmt = 0.16;
-        s.glossPow = 40.0;
+        s.roughness = 0.42;
         s.bumpAmt = 0.10;
     } else {   // kFamPaint - skirting board
         a = base * (0.9 + 0.2 * vnoise(float2(along * 30.0, p.y * 60.0)));
@@ -781,8 +832,8 @@ static Surface surfaceAt(float3 p, float3 n, int kind, thread const LevelMix &L,
         Surface o = materialFor(srcFor(L.b, kind), kind, p, n, along, waterY,
                                wallTex, hasTex, woodTex, hasWood, cfg);
         s.albedo = mix(s.albedo, o.albedo, L.t);
-        s.glossAmt = mix(s.glossAmt, o.glossAmt, L.t);
-        s.glossPow = mix(s.glossPow, o.glossPow, L.t);
+        s.roughness = mix(s.roughness, o.roughness, L.t);
+        s.metallic = mix(s.metallic, o.metallic, L.t);
         s.bumpAmt = mix(s.bumpAmt, o.bumpAmt, L.t);
     }
     return s;
@@ -925,7 +976,7 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
                 // the prop reads as melted rather than manufactured.
                 float wear = 0.94 + 0.10 * vnoise(p.xz * 3.0 + hp * 40.0);
                 s.albedo = pc * wear * (n.y > 0.6 ? 1.12 : 1.0);
-                s.glossAmt = (kind2 < 0.68) ? 0.10 : 0.02;
+                s.roughness = (kind2 < 0.68) ? 0.45 : 0.85;
                 s.bumpAmt = 0.0;
                 break;
             }
@@ -960,6 +1011,9 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
 
     float ao = calcAO(p, n, cfg);
     float3 V = -rd;
+    float ndv = max(dot(n, V), 1e-4);
+    float3 Rv = reflect(-V, n);
+    float3 f0 = mix(float3(0.04), s.albedo, s.metallic);   // dielectric default
 
     // Ambient follows the light dial on a curve, not linearly: a fever level at
     // 0.15 light should be gloomy and legible, not a black screen.
@@ -983,18 +1037,26 @@ static float3 shade(float3 p, float3 n, float3 rd, thread const LevelMix &L, flo
         float3 toL = lp - p;
         float d2 = dot(toL, toL);
         float3 L = toL * rsqrt(max(d2, 1e-5));
-        float nl = clamp(dot(n, L) * 0.62 + 0.38, 0.0, 1.0);
+        float nl = clamp(dot(n, L) * 0.62 + 0.38, 0.0, 1.0);   // wrap: see BRDF note
         float atten = 1.0 / (1.0 + d2 * 0.32);
         // Falloff must reach zero before a light can leave the 3x3 window
         // (1.5 * panel pitch horizontally), or seams appear on the floor.
         float2 hv = lc - p.xz;
         float range = clamp(1.0 - dot(hv, hv) / 9.0, 0.0, 1.0);
         range *= range;
-        float3 add = s.albedo * em * (0.075 * nl * atten * range);
-        if (s.glossAmt > 0.005) {
-            float3 H = normalize(L + V);
-            float sp = pow(max(dot(n, H), 0.0), s.glossPow);
-            add += em * (sp * s.glossAmt * 0.08 * atten * range);
+
+        float3 kd = s.albedo * (1.0 - s.metallic);
+        float3 add = kd * em * (0.075 * nl * atten * range);
+
+        // Specular toward a representative point on the panel rectangle
+        float3 Ls = normalize(rectRepresentativePoint(p, Rv, lp, ext) - p);
+        float ndl = max(dot(n, Ls), 0.0);
+        if (ndl > 0.0) {
+            float3 H = normalize(Ls + V);
+            float a = max(s.roughness * s.roughness, 0.002);
+            float3 F = F_Schlick(f0, max(dot(V, H), 0.0));
+            float spec = D_GGX(max(dot(n, H), 0.0), a) * V_SmithGGX(ndv, ndl, a);
+            add += em * F * (spec * ndl * atten * range * 0.09);
         }
         col += add;
         float lum = add.x + add.y + add.z;
