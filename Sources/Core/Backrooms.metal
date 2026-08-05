@@ -725,6 +725,8 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
         a = base * (0.85 + 0.30 * fbm(p.xz * 6.0));
         a *= 0.92 + 0.16 * vnoise(p.xz * 34.0);
         a *= 1.0 - 0.22 * blotch;
+        // Damp patches mat the pile down, which reads as smoother
+        s.roughness = clamp(0.96 - 0.24 * blotch, 0.5, 1.0);
         if (L.floorParam > 0.001) {
             // Carpet tiles: seams plus a slight per-tile dye-lot drift
             float2 g = abs(fract(p.xz / L.floorParam) - 0.5) * L.floorParam;
@@ -767,7 +769,10 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
                     * smoothstep(1.1, 0.35, p.y);
         a *= 1.0 - 0.20 * scuff;
         a *= 0.93 + 0.14 * hcell(int2(floor(floor(p.xz / kCell) / 6.0)), kSaltTint, cfg.seed);
-        s.roughness = 0.86;
+        // Roughness varies with the same masks that drive the colour: stained
+        // paper is smoother and slightly sized, the chalky band near the
+        // ceiling is rougher, scuffs are burnished.
+        s.roughness = clamp(0.86 - 0.20 * stain + 0.07 * grimeHi - 0.10 * scuff, 0.35, 0.97);
         s.bumpAmt = (hasTex > 0.5) ? 0.03 : 0.10;
     } else if (fam == kFamDrywall) {
         a = base * (0.94 + 0.10 * fbm(float2(along * 0.6, p.y * 0.6)));
@@ -783,7 +788,10 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
     } else if (fam == kFamConcrete) {
         if (kind == 0) {
             a = base * (0.85 + 0.25 * fbm(p.xz * 1.3));
-            s.roughness = 0.72; s.bumpAmt = 0.28;
+            // Traffic polishes concrete unevenly - broad smoother lanes
+            s.roughness = clamp(0.72 - 0.26 * smoothstep(0.45, 0.75, fbm(p.xz * 0.21 + 3.7)),
+                                0.30, 0.95);
+            s.bumpAmt = 0.28;
         } else if (kind == 1) {
             a = base * (0.9 + 0.2 * fbm(p.xz * 0.9));
             s.roughness = 0.85; s.bumpAmt = 0.12;
@@ -805,6 +813,13 @@ static Surface materialFor(int li, int kind, float3 p, float3 n, float along,
         // glazed ceramic is genuinely smooth - this is the biggest single
         // material change, and what finally makes the poolrooms read as tile
         s.roughness = (kind == 0) ? 0.18 : 0.26;
+        // Grout is porous cement, not glaze. It should kill the highlight dead.
+        s.roughness = mix(s.roughness, 0.88, grout);
+        if (kind == 2 && waterY > -0.1) {
+            // Still damp at the old waterline, so smoother there
+            s.roughness = mix(s.roughness, 0.10,
+                              0.7 * exp(-fabs(p.y - (waterY + 0.05)) * 18.0));
+        }
         s.bumpAmt = (kind == 2) ? 0.05 : 0.02;
     } else if (fam == kFamAcoustic) {
         a = base * (0.95 + 0.09 * vhash(floor(p.xz)));
