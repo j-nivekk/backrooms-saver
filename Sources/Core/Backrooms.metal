@@ -135,6 +135,36 @@ struct MapCfg {
     uint seed;
 };
 
+// ---------------------------------------------------------------------------
+// Bevels.
+//
+// Nothing built is knife-sharp. Drywall gets a corner bead, concrete arrises
+// are chamfered by the formwork, door jambs are eased, and every one of those
+// catches a highlight the eye reads as evidence of construction. A few
+// millimetres of radius is one of the cheapest realism cues there is - and it
+// is the one thing an SDF gives away almost free, where a mesh pays real
+// geometry for it.
+//
+// Rounding an intersection only ever REMOVES material, so openings get very
+// slightly larger and dQuick stays a valid lower bound. Safe in both directions
+// that matter here.
+// ---------------------------------------------------------------------------
+constant float kBevelWall = 0.012;   // where a wall segment ends
+constant float kBevelDoor = 0.016;   // door and arch reveals
+constant float kBevelCol  = 0.020;   // column arrises
+
+static float roundIntersect(float a, float b, float r)
+{
+    float2 u = max(float2(r + a, r + b), 0.0);
+    return min(-r, max(a, b)) + length(u);
+}
+
+/// Carve `hole` out of `a` with an eased arris rather than a sharp one.
+static float roundSubtract(float a, float hole, float r)
+{
+    return roundIntersect(a, -hole, r);
+}
+
 static float boxSDF(float3 p, float3 b)
 {
     float3 q = abs(p) - b;
@@ -252,7 +282,8 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
             // wall thickness at kHalfT * 1.8, and anything thicker turns that
             // early-out into an OVER-estimate, which lets rays tunnel through
             // and speckles the whole frame.
-            float d = max(abs(perp - lineC) - kHalfT * mix(1.2, 1.8, a1), aBox);
+            float d = roundIntersect(abs(perp - lineC) - kHalfT * mix(1.2, 1.8, a1),
+                                     aBox, kBevelWall);
             float aw = mix(2.55, 3.45, a1);                       // springing width
             float ah = max(cfg.ceilH - mix(0.22, 0.95, a2), 2.4);  // crown height
             // r sweeps a shallow segmental head through to a full semicircle
@@ -264,11 +295,11 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
             float2 q = abs(float2(xr, p.y - ah * 0.5 + 0.2))
                      - float2(aw * 0.5, ah * 0.5 + 0.2) + r;
             float hole = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-            return max(d, -hole);
+            return roundSubtract(d, hole, kBevelDoor);
         }
         if (sh >= cfg.archProb + cfg.soffitProb) return 1e5;
         float yBot = max(cfg.ceilH - mix(0.5, 0.85, fract(sh * 9.3)), 2.3);
-        float d = max(abs(perp - lineC) - kHalfT * 1.4, aBox);
+        float d = roundIntersect(abs(perp - lineC) - kHalfT * 1.4, aBox, kBevelWall);
         return max(d, yBot - p.y);
     }
 
@@ -287,7 +318,8 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
     // still meets its corners on the grid line. Peak sits mid-span, where the
     // doorway usually is, so it stays well inside the planner's door margin.
     float bow = cfg.bowAmt * (lh * 2.0 - 1.0) * sin(aL * (3.14159265 / kCell));
-    float d = max(abs(perp - lineC - lean * (p.y / cfg.ceilH) - bow) - halfT, aBox);
+    float d = roundIntersect(abs(perp - lineC - lean * (p.y / cfg.ceilH) - bow) - halfT,
+                            aBox, kBevelWall);
 
     if (edgeHash(e, axis, kSaltDoor, cfg.seed) < doorProb) {
         float frac = mix(0.28, 0.72, edgeHash(e, axis, kSaltDoorPos, cfg.seed));
@@ -298,7 +330,7 @@ static float wallSDF(float3 p, int2 e, int axis, float lineC, float alongOrigin,
         float2 q = abs(float2(aL - frac * kCell, p.y - dh * 0.5 + 0.2))
                  - float2(dw * 0.5, dh * 0.5 + 0.2) + r;
         float hole = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-        d = max(d, -hole);
+        d = roundSubtract(d, hole, kBevelDoor);
     } else {
         // Doorless walls are sometimes only chest-high partitions
         float hh = edgeHash(e, axis, kSaltHeight, cfg.seed);
@@ -351,7 +383,11 @@ static float map(float3 p, MapCfg cfg)
             if (shp > 0.82) q -= (0.14 * (hN - 0.5)) * float2(1.0, 0.65);
             dSq = max(abs(q.x), abs(q.y));
         }
-        d = min(d, mix(dSq, length(q), round) - r);
+        // Chamfered arrises on square columns, via a rounded box rather than
+        // the raw Chebyshev distance.
+        float2 qb = abs(q) - max(r - kBevelCol, 0.0);
+        float boxd = length(max(qb, 0.0)) + min(max(qb.x, qb.y), 0.0) - kBevelCol;
+        d = min(d, mix(boxd, length(q) - r, round));
 
         // Props hang off the same corners, so the existing 4-corner loop
         // already covers every prop within reach - no extra neighbourhood.
