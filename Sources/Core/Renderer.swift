@@ -25,6 +25,27 @@ struct GPUUniforms {
     var motion: SIMD4<Float>
     var entPos: SIMD4<Float>
     var entCfg: SIMD4<Float>
+    var taa: SIMD4<Float>
+}
+
+struct GPUTAAParams {
+    var ro: SIMD4<Float>
+    var right: SIMD4<Float>
+    var up: SIMD4<Float>
+    var fwd: SIMD4<Float>
+    var pro: SIMD4<Float>
+    var pright: SIMD4<Float>
+    var pup: SIMD4<Float>
+    var pfwd: SIMD4<Float>
+    var misc: SIMD4<Float>
+}
+
+/// Halton, for the sub-pixel jitter sequence. Low discrepancy beats random:
+/// 16 frames cover the pixel evenly instead of clumping.
+private func halton(_ index: Int, _ base: Int) -> Float {
+    var f: Float = 1, r: Float = 0, i = index
+    while i > 0 { f /= Float(base); r += f * Float(i % base); i /= base }
+    return r
 }
 
 /// A Look packs into three float4s so Swift and MSL agree on offsets without
@@ -63,8 +84,19 @@ public final class BackroomsRenderer {
     private let downsamplePipeline: MTLRenderPipelineState
     private let blurPipeline: MTLRenderPipelineState
     private let compositePipeline: MTLRenderPipelineState
+    private let taaPipeline: MTLRenderPipelineState
 
     private var hdr: MTLTexture?
+    private var history: [MTLTexture] = []
+    private var historyIndex = 0
+    private var jitterIndex = 0
+    private var prevEye = SIMD3<Float>(0, 0, 0)
+    private var prevRight = SIMD3<Float>(1, 0, 0)
+    private var prevUp = SIMD3<Float>(0, 1, 0)
+    private var prevFwd = SIMD3<Float>(0, 0, 1)
+    private var prevTanX: Float = 0.68
+    private var prevTanY: Float = 0.42
+    private var historyValid = false
     private var bloomA: MTLTexture?
     private var bloomB: MTLTexture?
     private var bloomC: MTLTexture?
@@ -153,6 +185,7 @@ public final class BackroomsRenderer {
         downsamplePipeline = try pipeline("downsample", "downsample_fs", Self.hdrFormat)
         blurPipeline = try pipeline("blur", "blur_fs", Self.hdrFormat)
         compositePipeline = try pipeline("composite", "composite_fs", targetPixelFormat)
+        taaPipeline = try pipeline("taa", "taa_fs", Self.hdrFormat)
     }
 
     public func resize(width: Int, height: Int) {
@@ -174,6 +207,8 @@ public final class BackroomsRenderer {
             return t
         }
         hdr = target(iw, ih, "hdr")
+        history = [target(iw, ih, "historyA"), target(iw, ih, "historyB")]
+        historyValid = false
         bloomA = target(iw / 2, ih / 2, "bloomA")
         bloomB = target(iw / 2, ih / 2, "bloomB")
         bloomC = target(iw / 4, ih / 4, "bloomC")
@@ -232,6 +267,19 @@ public final class BackroomsRenderer {
         let f = director.frame()
         let la = packLook(f.lookA), lb = packLook(f.lookB)
         let tanY = f.tanX * Float(internalSize.y) / Float(internalSize.x)
+
+        // Sub-pixel jitter, in NDC units, so successive frames sample different
+        // points inside the same pixel and the history converges to a supersample.
+        jitterIndex = (jitterIndex + 1) % 16
+        let jx = (halton(jitterIndex + 1, 2) - 0.5) * 2 / Float(internalSize.x)
+        let jy = (halton(jitterIndex + 1, 3) - 0.5) * 2 / Float(internalSize.y)
+
+        // A teleport is a hard cut, so the history is meaningless across it. At
+        // 0.55 m/s the camera covers under a centimetre a frame, so half a metre
+        // cannot be anything but a jump.
+        let jumped = simd_distance(f.eye, prevEye) > 0.5
+        let moving = simd_distance(f.eye, prevEye) > 1e-4
+        let discard = !historyValid || jumped
         var uniforms = GPUUniforms(
             eyeTime: SIMD4(f.eye.x, f.eye.y, f.eye.z, time),
             rightTanX: SIMD4(f.right.x, f.right.y, f.right.z, f.tanX),
@@ -244,17 +292,40 @@ public final class BackroomsRenderer {
             lookB0: lb.0, lookB1: lb.1, lookB2: lb.2,
             motion: SIMD4(f.motionCentre.x, f.motionCentre.y, f.motionFwd.x, f.motionFwd.y),
             entPos: SIMD4(f.entity.x, f.entity.y, f.entity.z, f.entityAlpha),
-            entCfg: SIMD4(f.entityType, f.entityScale, f.entityPhase, 0))
+            entCfg: SIMD4(f.entityType, f.entityScale, f.entityPhase, 0),
+            taa: SIMD4(jx, jy, 0, 0))
 
         pass(commandBuffer, label: "raymarch", pipeline: rayPipeline, target: hdr,
              inputs: [wallTexture, woodTexture]) { enc in
             enc.setFragmentBytes(&uniforms, length: MemoryLayout<GPUUniforms>.stride, index: 0)
         }
 
+        // Temporal resolve, into the history buffer everything downstream reads
+        let hCur = history[historyIndex]
+        let hPrev = history[1 - historyIndex]
+        historyIndex = 1 - historyIndex
+        var taaP = GPUTAAParams(
+            ro: SIMD4(f.eye.x, f.eye.y, f.eye.z, Float(internalSize.x)),
+            right: SIMD4(f.right.x, f.right.y, f.right.z, f.tanX),
+            up: SIMD4(f.up.x, f.up.y, f.up.z, tanY),
+            fwd: SIMD4(f.fwd.x, f.fwd.y, f.fwd.z, Float(internalSize.y)),
+            pro: SIMD4(prevEye.x, prevEye.y, prevEye.z, 0),
+            pright: SIMD4(prevRight.x, prevRight.y, prevRight.z, prevTanX),
+            pup: SIMD4(prevUp.x, prevUp.y, prevUp.z, prevTanY),
+            pfwd: SIMD4(prevFwd.x, prevFwd.y, prevFwd.z, 0),
+            misc: SIMD4(jx, jy, moving ? 1 : 0, discard ? 1 : 0))
+        pass(commandBuffer, label: "taa", pipeline: taaPipeline, target: hCur,
+             inputs: [hdr, hPrev]) { enc in
+            enc.setFragmentBytes(&taaP, length: MemoryLayout<GPUTAAParams>.stride, index: 0)
+        }
+        prevEye = f.eye; prevRight = f.right; prevUp = f.up; prevFwd = f.fwd
+        prevTanX = f.tanX; prevTanY = tanY
+        historyValid = true
+
         let halfTexel = SIMD2<Float>(1 / Float(bloomA.width), 1 / Float(bloomA.height))
         let quarterTexel = SIMD2<Float>(1 / Float(bloomC.width), 1 / Float(bloomC.height))
         postPass(commandBuffer, label: "bright", pipeline: brightPipeline, target: bloomA,
-                 inputs: [hdr], params: SIMD4(halfTexel.x, halfTexel.y, 1.15, 0))
+                 inputs: [hCur], params: SIMD4(halfTexel.x, halfTexel.y, 1.15, 0))
         postPass(commandBuffer, label: "blurH.half", pipeline: blurPipeline, target: bloomB,
                  inputs: [bloomA], params: SIMD4(halfTexel.x, 0, 0, 0))
         postPass(commandBuffer, label: "blurV.half", pipeline: blurPipeline, target: bloomA,
@@ -274,7 +345,7 @@ public final class BackroomsRenderer {
                        Float(internalSize.x), Float(internalSize.y)),
             textA: ta, textB: tb)
         pass(commandBuffer, label: "composite", pipeline: compositePipeline, target: target,
-             inputs: [hdr, bloomA, bloomC]) { enc in
+             inputs: [hCur, bloomA, bloomC]) { enc in
             enc.setFragmentBytes(&comp, length: MemoryLayout<GPUComposite>.stride, index: 0)
         }
     }

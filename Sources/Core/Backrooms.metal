@@ -24,6 +24,7 @@ struct RMUniforms {
     float4 motion;      // xy motion-light centre (xz), zw its forward (xz)
     float4 entPos;      // xyz entity world position, w alpha (0 = none)
     float4 entCfg;      // x type (0 smiler, 1 figure), y card scale, z phase, w unused
+    float4 taa;         // xy sub-pixel jitter in NDC units, zw unused
 };
 
 struct CompositeParams {
@@ -32,6 +33,22 @@ struct CompositeParams {
     float4 res;         // xy output resolution
     uint4 textA;        // glyph codes 0..15, one byte each
     uint4 textB;        // glyph codes 16..31
+};
+
+// Temporal accumulation. The world is static and the camera transform is known
+// analytically, so motion vectors are free: take the hit distance the raymarch
+// already computed, rebuild the world position, and project it through last
+// frame's basis. No velocity buffer, no G-buffer.
+struct TAAParams {
+    float4 ro;      // xyz eye, w internal width
+    float4 right;   // xyz right basis, w tan(fovX/2)
+    float4 up;      // xyz up basis, w tan(fovY/2)
+    float4 fwd;     // xyz forward basis, w internal height
+    float4 pro;     // xyz previous eye
+    float4 pright;  // xyz previous right, w previous tanX
+    float4 pup;     // xyz previous up, w previous tanY
+    float4 pfwd;    // xyz previous forward
+    float4 misc;    // x,y jitter in pixels, z camera moving, w discard history
 };
 
 struct PostParams {
@@ -1187,7 +1204,7 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
                              texture2d<float> wallTex [[texture(0)]],
                              texture2d<float> woodTex [[texture(1)]])
 {
-    float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y);
+    float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y) + U.taa.xy;
     float3 ro = U.eyeTime.xyz;
     float3 rd = normalize(U.fwdSeed.xyz
                           + U.rightTanX.xyz * (ndc.x * U.rightTanX.w)
@@ -1294,7 +1311,8 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
     }
 
     col = applyEntity(col, ro, rd, tHit, U.entPos, U.entCfg, L, t);
-    return float4(col, 1.0);
+    // Alpha carries the hit distance: that is the whole depth buffer TAA needs.
+    return float4(col, min(tHit, 400.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,6 +1320,8 @@ fragment float4 backrooms_fs(FSOut in [[stage_in]],
 // ---------------------------------------------------------------------------
 
 constexpr sampler linearSampler(filter::linear, address::clamp_to_edge);
+constexpr sampler pointSampler(filter::nearest, address::clamp_to_edge);
+
 
 fragment float4 bright_fs(FSOut in [[stage_in]],
                           texture2d<float> src [[texture(0)]],
@@ -1369,6 +1389,60 @@ static float3 sampleCatmullRom(texture2d<float> tex, float2 uv, float2 texSize)
         tex.sample(linearSampler, float2(tp12.x, tp3.y)).rgb * w12.x * w3.y +
         tex.sample(linearSampler, float2(tp3.x, tp3.y)).rgb * w3.x * w3.y;
     return max(c, 0.0);
+}
+
+/// Temporal resolve. Jittered samples accumulate into a history buffer, which
+/// is what buys back the detail the 0.6 internal scale throws away.
+///
+/// Neighbourhood clamping is not optional here even though the camera is often
+/// still: the panels flicker and the water ripples, and unclamped accumulation
+/// would average the flicker into a flat glow and smear the ripples. Clamping
+/// lets static geometry converge while anything that actually changed snaps.
+fragment float4 taa_fs(FSOut in [[stage_in]],
+                       constant TAAParams &T [[buffer(0)]],
+                       texture2d<float> cur [[texture(0)]],
+                       texture2d<float> hist [[texture(1)]])
+{
+    float4 c = cur.sample(pointSampler, in.uv);
+    float3 col = c.rgb;
+    if (T.misc.w > 0.5) return float4(col, 1.0);          // history discarded
+
+    float2 texel = 1.0 / float2(T.ro.w, T.fwd.w);
+    float3 lo = col, hi = col;
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        if (dx == 0 && dy == 0) continue;
+        float3 sN = cur.sample(pointSampler, in.uv + float2(dx, dy) * texel).rgb;
+        lo = min(lo, sN); hi = max(hi, sN);
+    }
+
+    // Rebuild this pixel's world position from the distance in alpha, using the
+    // same jittered ray the raymarch used, then project through last frame.
+    float2 ndc = float2(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y) + T.misc.xy;
+    float3 rd = normalize(T.fwd.xyz + T.right.xyz * (ndc.x * T.right.w)
+                                    + T.up.xyz * (ndc.y * T.up.w));
+    float3 wp = T.ro.xyz + rd * c.a;
+
+    float3 v = wp - T.pro.xyz;
+    float z = dot(v, T.pfwd.xyz);
+    if (z <= 0.05) return float4(col, 1.0);
+    float2 puv = float2(dot(v, T.pright.xyz) / (z * T.pright.w),
+                        dot(v, T.pup.xyz) / (z * T.pup.w));
+    puv = float2(puv.x * 0.5 + 0.5, 0.5 - puv.y * 0.5);
+    if (any(puv < 0.0) || any(puv > 1.0)) return float4(col, 1.0);   // disoccluded
+
+    // Catmull-Rom, not bilinear. Reprojection lands on a non-integer texel every
+    // frame, and a bilinear tap blurs slightly each time; over dozens of
+    // accumulated frames that compounds into mush. This is the single thing that
+    // decides whether TAA sharpens or softens.
+    float3 hRGB = sampleCatmullRom(hist, puv, float2(T.ro.w, T.fwd.w));
+    float4 h = float4(hRGB, hist.sample(linearSampler, puv).a);
+    float3 hc = h.rgb;
+    // A locked-off CCTV shot can converge much further than a drifting one.
+    float cap = (T.misc.z > 0.5) ? 12.0 : 48.0;
+    float n = min(h.a, cap);
+    float alpha = 1.0 / (n + 1.0);
+    return float4(mix(hc, col, alpha), n + 1.0);
 }
 
 static float3 acesFilm(float3 x)
